@@ -1,0 +1,516 @@
+//! Local additions to the emitter (fork-ports), kept out of `lower.rs`,
+//! which the asset policy holds under 512 KiB. A child module, so it shares
+//! the emitter's state.
+
+use super::*;
+
+impl Lower<'_> {
+    /// A vertex stopped at the loop limit has no position (or half of one):
+    /// the host would draw whatever its register holds, a triangle stretched
+    /// across the screen. A position that is not a number has the rasteriser
+    /// drop every triangle the vertex is in. `a` is the block the lane
+    /// leaves through.
+    pub(super) fn nan_position(&mut self, a: usize) {
+        if self.s.threads.is_some() || self.s.geometry.is_some() {
+            return;
+        }
+        let Some(id) = self
+            .s
+            .outputs
+            .iter()
+            .position(|o| o.kind == 3 && o.comp == 9 && o.row.is_some())
+        else {
+            return;
+        };
+        let cols = self.s.outputs[id].cols;
+        self.s.outputs[id].usage |= (1u8 << cols) - 1;
+        let nan = self.s.m.f32(f32::NAN.to_bits());
+        let void = self.s.t.void;
+        for col in 0..cols {
+            let args = [self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(col), nan];
+            self.s.op(a, "storeOutput.f32", Attr::NoUnwind, void, 5, &args);
+        }
+    }
+
+    /// Whether scalar arithmetic reads dword 2 or 3 of the descriptor that
+    /// `inst` loads from the start of an entry (`offset`, in bytes) into
+    /// `count` registers from `code` on: the console compiler folded
+    /// GetDimensions into reads of an image descriptor.
+    pub(super) fn size_read(&self, inst: &Inst, code: u8, count: u32, offset: Option<u32>) -> bool {
+        let p = self.x.p;
+        let read = |v: Value| {
+            p.blocks
+                .iter()
+                .any(|b| b.insts.iter().any(|i| matches!(i.fields, Fields::Sop { .. }) && i.reads.iter().any(|r| r.1 == v)))
+        };
+        offset.is_some_and(|o| o % 32 == 0)
+            && (2..count.min(4)).any(|k| inst.write(Reg::S(code + k as u8)).is_some_and(read))
+    }
+
+    /// [`view_address`] for a table entry chosen at run time (a computed
+    /// index into a descriptor table or the resource heap): the host's table
+    /// of the buffer views' title addresses by heap slot
+    /// ([`shader::SLOT_VIEWS`]).
+    pub(super) fn view_address_indexed(&mut self, site: Site, first: u8) -> Result<Option<(V, V, V, V)>, Why> {
+        let a = *self
+            .scalar
+            .get(&site)
+            .ok_or("an untracked descriptor load")?;
+        let root = self
+            .x
+            .native
+            .layout
+            .get(a.param)
+            .map(|p| p.root)
+            .ok_or("a descriptor outside the tables")?;
+        // (local, from fork PR #738: a heap slot the code names outright asks
+        // the table too; a table entry at a fixed place has its root view)
+        let fixed = a.dynamic.is_none();
+        if !matches!((root, fixed), (RootType::Table, false) | (RootType::ResourceHeap, _)) {
+            return Ok(None);
+        }
+        let c = self.cur;
+        let slot = self.heap_index(site, first, false)?;
+        let last = self.s.m.i32(crate::emit::shader::SLOT_VIEWS_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let shift = self.s.m.i32(view_record_shift());
+        let byte = self.s.m.bin(c, Bin::Shl, slot, shift);
+        let h = self.s.root_srv_handle(crate::emit::shader::SLOT_VIEWS);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(0xF);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let lo = self.s.m.extract(c, r, 0);
+        let hi = self.s.m.extract(c, r, 1);
+        let len = self.s.m.extract(c, r, 2);
+        let stride = self.s.m.extract(c, r, 3);
+        let (lo, hi, len, stride) = (
+            self.as_int(lo),
+            self.as_int(hi),
+            self.as_int(len),
+            self.as_int(stride),
+        );
+        // The loaded address is the view's own: `a.offset` is a place in the
+        // descriptor table (already part of `slot`), not in the buffer.
+        Ok(Some((lo, hi, len, stride)))
+    }
+}
+
+/// Whether relabelled compute threads take their ids from a counter
+/// instead of the wave's first flat id (`VICTORY_THREAD_TICKET=1`; off by
+/// default): [`take_ticket`].
+fn thread_ticket() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_TICKET.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_THREAD_TICKET").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Whether a group of `threads` in host waves of `wave` needs tickets:
+/// more than one wave and more than one dimension. A host may fill such
+/// a group from tiles (NVIDIA: 16 x 2 of a 32 x 2 group per wave), so the
+/// flat ids of two waves round down to the same start and half the
+/// thread ids are given twice, the other half never (issue #1243).
+fn wants_ticket(threads: [u32; 3], wave: u32) -> bool {
+    let group: u32 = threads.iter().product();
+    group > wave && group < 1 << 16 && threads.iter().filter(|&&t| t > 1).count() > 1
+}
+
+/// Whether one more dword fits a thread group's shared memory of
+/// `dwords`: the host takes 32 KiB per group at most and refuses the
+/// pipeline of a program that declares more ("The parameter is
+/// incorrect"; the validator does not check it). A program whose memory
+/// is full keeps the ids it had.
+fn lds_has_room(dwords: u32) -> bool {
+    dwords < 32768 / 4
+}
+
+/// Reserves the LDS dword of the tickets' counter for a compute program
+/// with console lanes that is not run in halves (`relabelled`), with
+/// [`thread_ticket`], where [`wants_ticket`] and the dword still fits
+/// ([`lds_has_room`]).
+pub(super) fn take_ticket(s: &mut Shader, relabelled: bool, wave: u32) {
+    let wanted = relabelled && thread_ticket() && s.threads.is_some_and(|t| wants_ticket(t, wave));
+    if wanted && lds_has_room(s.lds_dwords) {
+        s.ticket = Some(s.lds_dwords);
+        s.lds_dwords += 1;
+    }
+}
+
+/// What a wave of `count` lanes (of `wave`) that finds `old` in the
+/// counter adds to it, and the id of its first thread, in a group of
+/// `group` threads. Full waves take the next `wave` ids from 0 up (the
+/// low 16 bits count them); the others take theirs from the group's end
+/// down (the high 16 bits count their threads). The shader does the same
+/// in [`Lower::ticket_id`].
+#[cfg(test)]
+fn ticket(old: u32, count: u32, wave: u32, group: u32) -> (u32, u32) {
+    if count == wave {
+        (wave, old & 0xFFFF)
+    } else {
+        (count << 16, group - ((old >> 16) + count))
+    }
+}
+
+impl Lower<'_> {
+    /// The flat id of this thread in its group, from the tickets' counter
+    /// (`None`: the program takes no tickets, [`take_ticket`]): every
+    /// thread zeroes the counter, the group meets, the first lane of each
+    /// wave adds its wave's share and the wave takes what was there
+    /// ([`ticket`]); a thread's id is its wave's first plus its rank in
+    /// the wave. Each id of the group is given once whatever threads the
+    /// host puts in a wave; a full wave gets a wave-aligned run, so its
+    /// host lanes are its console lanes. Branch-free, in the entry block,
+    /// which every thread runs (as `wave_base`).
+    pub(super) fn ticket_id(&mut self) -> Option<V> {
+        let slot = self.s.ticket?;
+        if let Some(v) = self.s.ticket_id {
+            return Some(v);
+        }
+        let (e, i32t) = (self.s.entry, self.s.t.i32);
+        let group: u32 = self.s.threads?.iter().product();
+        let wave = self.s.wave_size?;
+        let lds = self.s.lds();
+        let k = self.s.m.i32(slot);
+        let zero = self.s.m.i32(0);
+        let ptr = self.s.m.element(e, lds, k);
+        self.s.m.store(e, ptr, zero);
+        self.group_sync(e);
+        let one = self.s.m.i32(1);
+        let (sum, unsigned) = (self.s.m.i8(0), self.s.m.i8(1));
+        let count = self.s.op(e, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[one, sum, unsigned]);
+        let rank = self.s.op(e, "wavePrefixOp.i32", Attr::NoUnwind, i32t, 121, &[one, sum, unsigned]);
+        let (kw, k16) = (self.s.m.i32(wave), self.s.m.i32(16));
+        let full = self.s.m.cmp(e, pred::EQ, count, kw);
+        let first = self.s.m.cmp(e, pred::EQ, rank, zero);
+        let high = self.s.m.bin(e, Bin::Shl, count, k16);
+        let share = self.s.m.select(e, full, kw, high);
+        let add = self.s.m.select(e, first, share, zero);
+        let ptr = self.s.m.element(e, lds, k);
+        let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
+        let found = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let low_mask = self.s.m.i32(0xFFFF);
+        let low = self.s.m.bin(e, Bin::And, found, low_mask);
+        let before = self.s.m.bin(e, Bin::LShr, found, k16);
+        let taken = self.s.m.bin(e, Bin::Add, before, count);
+        let kg = self.s.m.i32(group);
+        let tail = self.s.m.bin(e, Bin::Sub, kg, taken);
+        let base = self.s.m.select(e, full, low, tail);
+        let id = self.s.m.bin(e, Bin::Add, base, rank);
+        self.s.flags |= flags::WAVE_OPS;
+        self.s.ticket_id = Some(id);
+        Some(id)
+    }
+
+    /// Component `c` of the thread id whose flat id is `f`, in a group
+    /// `x` by `y` (by anything).
+    pub(super) fn id_part(&mut self, f: V, c: u8, x: u32, y: u32) -> Val {
+        let e = self.s.entry;
+        let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
+        Val::I32(match c {
+            0 => self.s.m.bin(e, Bin::URem, f, xk),
+            1 => {
+                let t = self.s.m.bin(e, Bin::UDiv, f, xk);
+                self.s.m.bin(e, Bin::URem, t, yk)
+            }
+            _ => self.s.m.bin(e, Bin::UDiv, f, xy),
+        })
+    }
+}
+
+#[cfg(test)]
+mod ticket_tests {
+    use super::{ticket, wants_ticket};
+
+    /// The ids the threads of waves of these sizes get, taken in this
+    /// order, sorted.
+    fn ids(waves: &[u32], wave: u32, group: u32) -> Vec<u32> {
+        let mut counter = 0u32;
+        let mut ids = Vec::new();
+        for &count in waves {
+            let (add, base) = ticket(counter, count, wave, group);
+            counter += add;
+            ids.extend(base..base + count);
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    fn once_each(waves: &[u32], wave: u32) {
+        let group: u32 = waves.iter().sum();
+        assert_eq!(ids(waves, wave, group), (0..group).collect::<Vec<_>>(), "{waves:?}");
+    }
+
+    #[test]
+    fn full_waves_take_wave_aligned_runs_from_the_start() {
+        once_each(&[32, 32], 32);
+        once_each(&[32; 8], 32);
+        once_each(&[64; 4], 64);
+        assert_eq!(ticket(64, 32, 32, 256), (32, 64));
+    }
+
+    #[test]
+    fn one_part_wave_takes_the_end() {
+        once_each(&[32, 32, 32, 4], 32);
+        once_each(&[4, 32, 32, 32], 32);
+        once_each(&[32, 4, 32, 32], 32);
+    }
+
+    #[test]
+    fn many_part_waves_in_any_order_give_each_id_once() {
+        once_each(&[16, 16, 16, 16], 32);
+        once_each(&[20, 32, 12, 32, 31, 1], 32);
+        once_each(&[1, 31, 32, 7, 25, 3, 29], 32);
+        once_each(&[10; 10], 32);
+        once_each(&[40, 64, 24, 64], 64);
+    }
+
+    #[test]
+    fn only_groups_of_more_than_one_wave_and_dimension_take_tickets() {
+        assert!(wants_ticket([32, 2, 1], 32));
+        assert!(wants_ticket([8, 16, 1], 32));
+        assert!(wants_ticket([4, 4, 4], 32));
+        assert!(!wants_ticket([64, 1, 1], 32));
+        assert!(!wants_ticket([1, 64, 1], 32));
+        assert!(!wants_ticket([8, 4, 1], 32));
+        assert!(!wants_ticket([8, 8, 1], 64));
+    }
+
+    #[test]
+    fn a_group_whose_shared_memory_is_full_takes_no_ticket() {
+        assert!(super::lds_has_room(0));
+        assert!(super::lds_has_room(8191));
+        assert!(!super::lds_has_room(8192));
+        assert!(!super::lds_has_room(8225));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`thread_ticket`], for its thread only.
+    static TEST_TICKET: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The thread ids of relabelled groups on the hardware device: each
+/// thread stores 1 at a place its id names, and the ones are counted.
+#[cfg(test)]
+mod ticket_card_tests {
+    use super::super::super::host::{Dispatch, Host, Root, View};
+    use super::super::super::{HostShader, validator};
+    use super::super::{Parts, TEST_HOST_WAVE, lower};
+    use super::TEST_TICKET;
+    use crate::native::{ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource};
+    use crate::{io, ir, resource, structure};
+
+    /// A console program of 32-lane waves in groups of `x` by `y` threads
+    /// (ids in v0, v1) that reads a lane mask as a number, so its threads
+    /// are relabelled, and stores 1 to dword `y << 8 | x` of a raw UAV.
+    fn program(x: u32, y: u32) -> NativeProgram {
+        let words: [u32; 13] = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+            125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
+            0xBE94_036A, // s_mov_b32 s20, vcc_lo
+            0x7E0C_0214, // v_mov_b32 v6, s20
+            0x7E0A_0281, // v_mov_b32 v5, 1
+            26 << 25 | 2 << 17 | 1 << 9 | 0x88,  // v_lshlrev_b32 v2, 8, v1
+            28 << 25 | 2 << 17 | 2 << 9 | 0x100, // v_or_b32 v2, v0, v2
+            26 << 25 | 2 << 17 | 2 << 9 | 0x82,  // v_lshlrev_b32 v2, 2, v2
+            0x38 << 26 | 0x1C << 18 | 1 << 12,
+            0x80 << 24 | 2 << 16 | 5 << 8 | 2, // buffer_store_dword v5, v2, s[8:11], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![
+                RootParam { root: RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
+                RootParam { root: RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 1 },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1 | 1 << 11, // 5 user SGPRs, two thread id components
+                threads: [x, y, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    /// `program` for a host of 32-lane waves, with tickets or without.
+    fn lowered(native: &NativeProgram, tickets: bool) -> HostShader {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure_wide(&p, &Default::default()).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, native).expect("io::raise");
+        let (wave, ticket) = (TEST_HOST_WAVE.replace(Some(32)), TEST_TICKET.replace(Some(tickets)));
+        let lowered = lower(&Parts {
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        });
+        TEST_HOST_WAVE.set(wave);
+        TEST_TICKET.set(ticket);
+        let lowered = lowered.expect("lower");
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers.iter().map(|&(w, _)| w).collect(),
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views,
+        };
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        }
+        shader
+    }
+
+    /// How many of the `x * y` thread ids of one group were given, and
+    /// how many places outside them were written; None without a device
+    /// that takes the program.
+    fn given(x: u32, y: u32, tickets: bool) -> Option<(u32, u32)> {
+        let shader = lowered(&program(x, y), tickets);
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 hardware device; not run");
+            return None;
+        };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            eprintln!("the hardware device does not take this program; not run");
+            return None;
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch { roots: vec![(0, Root::Constants(ud))], views: &[View::RawUav(256 * 64)], samplers: &[], groups: [1, 1, 1] },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let (mut inside, mut outside) = (0, 0);
+        for (at, &v) in out[0].iter().enumerate() {
+            let (tx, ty) = (at as u32 & 0xFF, at as u32 >> 8);
+            if v != 0 {
+                if tx < x && ty < y { inside += 1 } else { outside += 1 }
+            }
+        }
+        Some((inside, outside))
+    }
+
+    const GROUPS: [(u32, u32); 9] = [(32, 2), (32, 8), (64, 4), (24, 8), (12, 12), (10, 10), (8, 8), (16, 16), (64, 1)];
+
+    #[test]
+    fn with_tickets_every_thread_id_of_a_group_is_given_once() {
+        let _one = super::super::super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (x, y) in GROUPS {
+            let Some((inside, outside)) = given(x, y, true) else { return };
+            assert_eq!((inside, outside), (x * y, 0), "{x} x {y}");
+        }
+        eprintln!("ran on the hardware device: every id of every group given");
+    }
+
+    /// What the rounding gives on this device, said and not judged: a
+    /// host that fills its waves in rows passes it, one that fills them
+    /// from tiles gives some ids twice.
+    #[test]
+    fn without_tickets_the_ids_given_are_said() {
+        let _one = super::super::super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (x, y) in GROUPS {
+            let Some((inside, outside)) = given(x, y, false) else { return };
+            eprintln!("rounding, {x} x {y}: {inside} of {} ids given, {outside} places outside written", x * y);
+        }
+    }
+}
+
+/// Whether floats that are not finite numbers are written as 0 where a
+/// shader hands them on (`VICTORY_NAN_SCRUB=1`; off by default): the
+/// colours a pixel shader exports and the values of float image stores.
+/// One such value in a target that later passes read (blur, exposure,
+/// temporal history) turns into black or flat-coloured patches that
+/// spread; the console's own targets often clamp where the host's do not.
+///
+/// The idea is from trustno1-coder/VIctory-NVIDIA, commit 77e13a974
+/// (GPL-3.0-or-later); written anew here.
+pub(crate) fn nan_scrub() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_NAN_SCRUB").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Whether `bits` is the pattern of an infinity or a NaN: what
+/// [`Lower::scrub`] has the shader test.
+#[cfg(test)]
+fn not_finite(bits: u32) -> bool {
+    bits & 0x7FFF_FFFF >= 0x7F80_0000
+}
+
+impl Lower<'_> {
+    /// `f`, or 0 where it is an infinity or a NaN, with [`nan_scrub`];
+    /// `f` itself and nothing emitted without.
+    pub(super) fn scrub(&mut self, f: V) -> V {
+        if nan_scrub() { self.scrubbed(f) } else { f }
+    }
+
+    /// 0 where `f` is an infinity or a NaN, else `f`. On the bits: a
+    /// float compare may be folded away by a host compiler that takes
+    /// floats to be finite.
+    fn scrubbed(&mut self, f: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mask = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mask);
+        let inf = self.s.m.i32(0x7F80_0000);
+        let bad = self.s.m.cmp(c, pred::IUGE, abs, inf);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, bad, zero, f)
+    }
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::not_finite;
+
+    #[test]
+    fn infinities_and_nans_are_the_values_scrubbed() {
+        for bad in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN, -f32::NAN] {
+            assert!(not_finite(bad.to_bits()), "{bad}");
+        }
+        assert!(not_finite(0x7F80_0001) && not_finite(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn numbers_are_left_alone() {
+        for fine in [0.0, -0.0, 1.0, -1.0, f32::MAX, f32::MIN, f32::MIN_POSITIVE, 1e-45] {
+            assert!(!not_finite(fine.to_bits()), "{fine}");
+        }
+    }
+}
