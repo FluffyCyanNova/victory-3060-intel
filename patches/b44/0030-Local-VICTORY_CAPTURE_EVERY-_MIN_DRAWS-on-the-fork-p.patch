@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 13:47:05 +0800
+Subject: [PATCH 30/43] Local: VICTORY_CAPTURE_EVERY/_MIN_DRAWS on the fork
+ (ported from cfc1f3b9)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/capture.rs | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/crates/victory-gpu/src/capture.rs b/crates/victory-gpu/src/capture.rs
+index c72b6fa5c..bc854340b 100644
+--- a/crates/victory-gpu/src/capture.rs
++++ b/crates/victory-gpu/src/capture.rs
+@@ -128,6 +128,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
+     use std::sync::atomic::Ordering::Relaxed;
+     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+     let before = LAST.swap(drawn, Relaxed);
++    FRAME_DRAWS.store(drawn.saturating_sub(before), Relaxed);
+     if world_on()
+         && drawn.saturating_sub(before) >= 500
+         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
+@@ -142,6 +143,27 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
+     }
+ }
+ 
++/// Draws the last presented frame ran on the host.
++static FRAME_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++/// Local (2026-11-25, ported from our line, cfc1f3b9): `VICTORY_CAPTURE_EVERY=<n>`
++/// saves every `n`th frame that ran at least `VICTORY_CAPTURE_MIN_DRAWS`
++/// draws (default 500: world frames, not loading screens), without tracing.
++fn every(n: u64) -> bool {
++    static SETTING: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
++    let setting = *SETTING.get_or_init(|| {
++        let every = std::env::var("VICTORY_CAPTURE_EVERY").ok()?.trim().parse::<u64>().ok()?;
++        let min = std::env::var("VICTORY_CAPTURE_MIN_DRAWS")
++            .ok()
++            .and_then(|v| v.trim().parse().ok())
++            .unwrap_or(500);
++        (every > 0).then_some((every, min))
++    });
++    setting.is_some_and(|(every, min)| {
++        n % every == 0 && FRAME_DRAWS.load(std::sync::atomic::Ordering::Relaxed) >= min
++    })
++}
++
+ /// Whether frame `n` is saved.
+ pub(crate) fn wanted(n: u64) -> bool {
+     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
+@@ -152,7 +174,7 @@ pub(crate) fn wanted(n: u64) -> bool {
+     // run, so single frames cannot be compared between runs).
+     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
++    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || every(n))
+ }
+ 
+ /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.

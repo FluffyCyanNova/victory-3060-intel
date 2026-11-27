@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Thu, 26 Nov 2026 22:20:01 +0800
+Subject: [PATCH 4/5] Game saves: every update is said in the log, and a failed
+ update or read with its result
+
+A save that failed was silent on our side: the title shows its own
+prompt and the log had no line of the save code at all. Each update now
+says its container, blob count and bytes, as info when written and as a
+warning with the HRESULT when it fails; a failed read says its container
+and HRESULT. No behaviour change.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-hle/src/modules/xgamesave.rs | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/crates/victory-hle/src/modules/xgamesave.rs b/crates/victory-hle/src/modules/xgamesave.rs
+index 560b6a60b..e045b7c1d 100644
+--- a/crates/victory-hle/src/modules/xgamesave.rs
++++ b/crates/victory-hle/src/modules/xgamesave.rs
+@@ -770,7 +770,10 @@ extern "system" fn read_blobs(
+     let wanted = unsafe { count.as_ref() }.copied().unwrap_or(0);
+     let blobs = match read(c, names(blob_names, wanted)) {
+         Ok(blobs) => blobs,
+-        Err(hr) => return hr,
++        Err(hr) => {
++            tracing::warn!(container = %c.name, hr = format_args!("{:#010x}", hr as u32), "game save: a read FAILED");
++            return hr;
++        }
+     };
+     let bytes = layout(&blobs, out as usize);
+     if out.is_null() || size < bytes.len() {
+@@ -794,6 +797,10 @@ extern "system" fn read_async(
+         Some(c) => read(c, names(blob_names, count)).map(|blobs| layout(&blobs, 0)),
+         None => Err(E_INVALIDARG),
+     };
++    if let Err(hr) = &result {
++        let container = get(container).map_or("", |c| c.name.as_str());
++        tracing::warn!(container, hr = format_args!("{:#010x}", *hr as u32), "game save: a read FAILED");
++    }
+     xasync::finished_with(block, (&raw const READ).cast(), result)
+ }
+ extern "system" fn read_result(
+@@ -895,6 +902,17 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
+ 
+ extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
+     let hr = get(update).map_or(E_INVALIDARG, Update::submit);
++    // (local) Said either way: a save that fails is otherwise silent here,
++    // the title only shows its own prompt.
++    let (container, blobs, bytes) = get(update).map_or((String::new(), 0, 0), |u| {
++        let bytes: usize = u.changes.iter().filter_map(|(_, data)| data.as_ref().map(Vec::len)).sum();
++        (u.name.clone(), u.changes.len(), bytes)
++    });
++    if hr == S_OK {
++        tracing::info!(container, blobs, bytes, "game save: an update was written");
++    } else {
++        tracing::warn!(container, blobs, bytes, hr = format_args!("{:#010x}", hr as u32), "game save: an update FAILED");
++    }
+     xasync::finished(block, (&raw const SUBMIT).cast(), hr)
+ }
+ extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {

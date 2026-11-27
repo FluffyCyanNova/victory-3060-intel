@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 03:00:35 +0100
+Subject: [PATCH 3/3] Shaders/bitcode+shader: clear flags::DOUBLES in
+ Shader::finish when dead doubles are removed
+
+- Add `pub doubles: bool` to `bitcode::opt::Usage` and populate it in
+  `Module::usage()` whenever any reachable instruction/PHI result or operand
+  has `TypeDef::Double`, mirroring `Usage::int64`.
+- Include `(flags::DOUBLES, used.doubles)` in `Shader::finish()`'s flag
+  reconciliation loop so `DEAD`/`FOLD` removing all `double` operations also
+  clears `flags::DOUBLES` from both `dx.entryPoints` and `SFI0` (avoiding
+  DXIL validation failure `META.FLAGSUSAGE`).
+- Add synthetic unit test `dead_doubles_clear_doubles_flag_and_pass_validation`.
+
+(cherry picked from commit 86f0a523581916c7dcf2abe98de8d08482251816)
+---
+ crates/victory-shader/src/emit/bitcode/opt.rs | 10 +++-
+ crates/victory-shader/src/emit/shader.rs      | 51 +++++++++++++++++++
+ 2 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/crates/victory-shader/src/emit/bitcode/opt.rs b/crates/victory-shader/src/emit/bitcode/opt.rs
+index ee446e2d1..cb15bd426 100644
+--- a/crates/victory-shader/src/emit/bitcode/opt.rs
++++ b/crates/victory-shader/src/emit/bitcode/opt.rs
+@@ -67,6 +67,8 @@ pub(crate) struct Usage {
+     pub barycentrics: bool,
+     /// A 64-bit integer, as a result or an operand.
+     pub int64: bool,
++    /// A 64-bit float (`double`), as a result or an operand.
++    pub doubles: bool,
+     /// A typed load of several components from a UAV.
+     pub typed_uav_loads: bool,
+     /// A handle from the view heap.
+@@ -970,6 +972,7 @@ impl Module {
+         let mut u = Usage::default();
+         let reached = self.reached();
+         let wide = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Int(64);
++        let double = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Double;
+         // The first field of a handle's annotation: its kind, with the UAV
+         // bit; the second: the component type and count.
+         let annotation = |h: V| -> Option<(i64, i64)> {
+@@ -998,7 +1001,12 @@ impl Module {
+             for &i in blk.phis.iter().chain(&blk.body) {
+                 let inst = &self.insts[i as usize];
+                 u.int64 |= wide(inst.ty);
+-                for_each_operand(&inst.op, |v| u.int64 |= wide(self.type_of(v)));
++                u.doubles |= double(inst.ty);
++                for_each_operand(&inst.op, |v| {
++                    let ty = self.type_of(v);
++                    u.int64 |= wide(ty);
++                    u.doubles |= double(ty);
++                });
+                 let Op::Call(f, args) = &inst.op else {
+                     continue;
+                 };
+diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
+index c7f2c10a8..e07e5aaf5 100644
+--- a/crates/victory-shader/src/emit/shader.rs
++++ b/crates/victory-shader/src/emit/shader.rs
+@@ -480,6 +480,7 @@ impl Shader {
+                 (flags::WAVE_OPS, used.wave_ops),
+                 (flags::BARYCENTRICS, used.barycentrics || has_bary_input),
+                 (flags::INT64, used.int64),
++                (flags::DOUBLES, used.doubles),
+                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
+                 (flags::RESOURCE_HEAP, used.heap_views),
+                 (flags::SAMPLER_HEAP, used.heap_samplers),
+@@ -928,3 +929,53 @@ impl Shader {
+         Some(self.m.md_node(list))
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::emit::bitcode::Term;
++
++    #[test]
++    fn dead_doubles_clear_doubles_flag_and_pass_validation() {
++        let mut s = Shader::new(false);
++        s.threads = Some([32, 1, 1]);
++        s.flags |= flags::WAVE_OPS | flags::DOUBLES;
++        let e = s.entry;
++        let f64t = s.m.double();
++        let lo = s.m.i32(0);
++        let hi = s.m.i32(0x3FF0_0000);
++        let d = s.op(e, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
++        let k0 = s.m.i8(0);
++        let sum = s.op(e, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[d, k0, k0]);
++        let split_ty = s.m.named_struct("dx.types.splitdouble", vec![s.t.i32, s.t.i32]);
++        let _split = s.op(e, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
++        s.m.terminate(e, Term::Ret);
++
++        // Before optimization, usage reports both doubles and wave ops.
++        let before = s.m.usage();
++        assert!(before.doubles);
++        assert!(before.wave_ops);
++
++        // After finish() runs module optimization, dead doubles are removed and
++        // SFI0 must not declare DOUBLES (bit 0).
++        let mut container = s.finish();
++        let count = u32::from_le_bytes(container[28..32].try_into().unwrap()) as usize;
++        let feature_bits = (0..count)
++            .find_map(|i| {
++                let off =
++                    u32::from_le_bytes(container[32 + i * 4..36 + i * 4].try_into().unwrap())
++                        as usize;
++                (&container[off..off + 4] == b"SFI0")
++                    .then(|| u64::from_le_bytes(container[off + 8..off + 16].try_into().unwrap()))
++            })
++            .expect("SFI0 chunk");
++        assert_eq!(feature_bits & 0x1, 0, "dead DOUBLES flag must be cleared in SFI0");
++
++        if let Ok(mut v) =
++            super::super::validator::Validator::load(super::super::validator::Validator::default_path().as_deref())
++        {
++            v.validate(&mut container)
++                .expect("DXIL validator must accept shader after clearing dead DOUBLES");
++        }
++    }
++}

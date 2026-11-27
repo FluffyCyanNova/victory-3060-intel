@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 13:50:31 +0800
+Subject: [PATCH 02/43] Local (fork-ports): a vertex a loop limit stops gets a
+ not-a-number position
+
+A vertex program left at the loop limit returned with its position unwritten;
+the rasteriser drew the register's leftovers as triangles stretched across the
+screen. Its position is now NaN, so those triangles are dropped. Unbuilt.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-shader/src/emit/lower.rs | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 99bece352..f10c2c2dc 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -11107,6 +11107,26 @@ impl<'a> Lower<'a> {
+             let t = self.s.m.bool(true);
+             self.s
+                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
++        } else if self.s.threads.is_none() && self.s.geometry.is_none() {
++            // A vertex stopped here has no position (or half of one): the
++            // host would draw whatever its register holds, a triangle
++            // stretched across the screen. A position that is not a number
++            // has the rasteriser drop every triangle the vertex is in.
++            if let Some(id) = self
++                .s
++                .outputs
++                .iter()
++                .position(|o| o.kind == 3 && o.comp == 9 && o.row.is_some())
++            {
++                let cols = self.s.outputs[id].cols;
++                self.s.outputs[id].usage |= (1u8 << cols) - 1;
++                let nan = self.s.m.f32(f32::NAN.to_bits());
++                let void = self.s.t.void;
++                for col in 0..cols {
++                    let args = [self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(col), nan];
++                    self.s.op(a, "storeOutput.f32", Attr::NoUnwind, void, 5, &args);
++                }
++            }
+         }
+         self.s.m.terminate(a, Term::Ret);
+         self.abort = Some(a);

@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Tue, 24 Nov 2026 13:02:36 -0800
+Subject: [PATCH 14/43] GPU: hash textures that changed lately at every check
+
+The texture guard skips a texture in view memory unless it saw a write,
+hashing it only every eighth frame. It cannot see writes through another
+view, so a ring of video frames filled that way was shown out of order:
+the startup animation flickered back and forth. A texture whose hash
+changed is now hashed at every check for 30 frames.
+
+(cherry picked from commit 059ab35292d1293ec9969dfbe869491b8005049c)
+(cherry picked from commit d9770b9d20593842e8882a6fa3b51314e45a7232)
+---
+ crates/victory-gpu/src/texture.rs | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+index 7edc2561c..bd08671ea 100644
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -71,6 +71,9 @@ pub(crate) struct Staging {
+     waiting: std::sync::atomic::AtomicU64,
+ }
+ 
++/// How long a texture whose hash changed is hashed at every check.
++const LIVE_FRAMES: u64 = 30;
++
+ /// What a texture's staging buffer holds: the hash of the memory detiled
+ /// (memory not watched), or the write-watch asking it was detiled after.
+ #[derive(Default)]
+@@ -79,6 +82,8 @@ struct Last {
+     asked: u64,
+     /// The frame a partly mapped texture was last read in.
+     partial: Option<u64>,
++    /// The frame a hash last found the texture changed in.
++    changed: Option<u64>,
+ }
+ 
+ // SAFETY: the staging mapping is written only at submission, under
+@@ -951,8 +956,14 @@ impl Staging {
+             const HASH_EVERY: u64 = 8;
+             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+             last.asked = now;
+-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+-            if unwritten && !turn {
++            let frame = crate::frame::current();
++            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
++            // A texture that changed lately is hashed at every check: the
++            // guard misses writes through another view (a video decoder
++            // filling a ring of frames), and every eighth frame showed such
++            // a ring out of order.
++            let live = last.changed.is_some_and(|at| frame < at + LIVE_FRAMES);
++            if unwritten && !turn && !live {
+                 return 0;
+             }
+         }
+@@ -1017,6 +1028,7 @@ impl Staging {
+                     return size;
+                 }
+                 last.hash = Some(hash);
++                last.changed = Some(crate::frame::current());
+                 self.detile(tiled);
+                 #[cfg(feature = "diagnostics")]
+                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+@@ -1033,6 +1045,7 @@ impl Staging {
+             return size;
+         }
+         last.hash = Some(hash);
++        last.changed = Some(crate::frame::current());
+         self.detile(tiled);
+         #[cfg(feature = "diagnostics")]
+         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);

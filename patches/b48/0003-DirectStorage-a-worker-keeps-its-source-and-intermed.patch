@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Thu, 26 Nov 2026 21:55:49 +0800
+Subject: [PATCH 3/3] DirectStorage: a worker keeps its source and intermediate
+ buffers between requests
+
+A compressed request allocated and zero-filled a buffer for its source,
+and another for what zlib leaves for BCPack, hundreds of times a second.
+Each worker keeps both now (up to 8 MiB each; a larger one is let go
+after its request).
+
+After upstream pull request #2981 by RVZO6. Its other half, a
+decompressor kept per worker, is not needed here: this line inflates with
+zlib-rs through a state kept per thread already.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-hle/src/modules/dstorage.rs | 79 +++++++++++++++++-----
+ 1 file changed, 62 insertions(+), 17 deletions(-)
+
+diff --git a/crates/victory-hle/src/modules/dstorage.rs b/crates/victory-hle/src/modules/dstorage.rs
+index dc2f0d73a..a10fa8256 100644
+--- a/crates/victory-hle/src/modules/dstorage.rs
++++ b/crates/victory-hle/src/modules/dstorage.rs
+@@ -17,7 +17,6 @@
+ #![allow(non_snake_case)]
+ #![allow(clippy::not_unsafe_ptr_arg_deref)]
+ 
+-use std::borrow::Cow;
+ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+ use std::ffi::{CStr, c_char, c_void};
+ use std::os::windows::fs::FileExt;
+@@ -573,6 +572,7 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
+ 
+ /// A worker: runs the next read of the most deserving queue.
+ fn work(scheduler: &'static Scheduler) {
++    let mut scratch = WorkerScratch::default();
+     let mut lanes = scheduler.lock();
+     loop {
+         let Some(job) = lanes.start() else {
+@@ -581,7 +581,8 @@ fn work(scheduler: &'static Scheduler) {
+         };
+         drop(lanes);
+         let started = std::time::Instant::now();
+-        let result = execute(&job.request);
++        let result = execute(&job.request, &mut scratch);
++        scratch.trim();
+         walls_request(&job.request, &result, started);
+         lanes = scheduler.lock();
+         lanes.finish(&job, result);
+@@ -945,8 +946,32 @@ extern "system" fn close(this: QueueRef) {
+     close_lane(unsafe { &*this }.state.id);
+ }
+ 
++/// The most a worker keeps of each of its buffers between requests: one
++/// large read does not hold its memory for the rest of the run.
++const SCRATCH_KEPT: usize = 8 << 20;
++
++/// A worker's buffers, kept from one request to the next (a worker runs one
++/// request at a time): a compressed request's source, and what zlib leaves
++/// for BCPack. A buffer for each request was allocated and filled with
++/// zeros first, hundreds of times a second.
++#[derive(Default)]
++struct WorkerScratch {
++    source: Vec<u8>,
++    intermediate: Vec<u8>,
++}
++
++impl WorkerScratch {
++    fn trim(&mut self) {
++        for buffer in [&mut self.source, &mut self.intermediate] {
++            if buffer.capacity() > SCRATCH_KEPT {
++                *buffer = Vec::new();
++            }
++        }
++    }
++}
++
+ /// Reads, inflates and/or unpacks, and writes one request.
+-fn execute(request: &Request) -> Result<(), HRESULT> {
++fn execute(request: &Request, scratch: &mut WorkerScratch) -> Result<(), HRESULT> {
+     let options = request.options;
+     let fail = |hr: HRESULT, why: &str| {
+         tracing::warn!(
+@@ -996,21 +1021,24 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
+         .map_err(|hr| fail(hr, "copying"));
+     }
+     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
+-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
++    let WorkerScratch { source: kept, intermediate } = scratch;
++    let source = read_source(request, kept).map_err(|hr| fail(hr, "reading the source"))?;
+     // The console's order: zlib first, then BCPack.
+     let source = if bc != 0 && options & ZLIB != 0 {
+-        let mut packed = vec![0; request.intermediate_size as usize];
+-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
+-        packed.truncate(n);
+-        Cow::Owned(packed)
++        let size = request.intermediate_size as usize;
++        if intermediate.len() < size {
++            intermediate.resize(size, 0);
++        }
++        let n = inflate(source, &mut intermediate[..size]).map_err(|hr| fail(hr, "zlib"))?;
++        &intermediate[..n]
+     } else {
+         source
+     };
+     into_destination(request, size, |out| match tables {
+-        Some(tables) => bcpack::decode(bc, &source, out, tables)
++        Some(tables) => bcpack::decode(bc, source, out, tables)
+             .map(|()| out.len())
+             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
++        None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
+     })?;
+     tracing::trace!(
+         options = format_args!("{options:#x}"),
+@@ -1110,17 +1138,18 @@ fn load_bcpack_tables() -> Result<Tables, String> {
+ }
+ 
+ /// A compressed request's source: borrowed from memory, or read from the
+-/// file.
+-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
++/// file into the worker's buffer `kept`.
++fn read_source<'a>(request: &Request, kept: &'a mut Vec<u8>) -> Result<&'a [u8], HRESULT> {
+     let size = request.source_size as usize;
+     if request.options & MEMORY_SOURCE != 0 {
+         // SAFETY: the title's source holds `size` bytes until completion.
+-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
+-        return Ok(Cow::Borrowed(bytes));
++        return Ok(unsafe { std::slice::from_raw_parts(request.source.cast(), size) });
++    }
++    if kept.len() < size {
++        kept.resize(size, 0);
+     }
+-    let mut bytes = vec![0; size];
+-    read_into(request, &mut bytes)?;
+-    Ok(Cow::Owned(bytes))
++    read_into(request, &mut kept[..size])?;
++    Ok(&kept[..size])
+ }
+ 
+ /// Nanoseconds workers spent reading files, for the debug summary.
+@@ -1511,6 +1540,22 @@ mod tests {
+             }
+         }
+     }
++    /// A worker keeps its buffers between requests, but not a very large one.
++    #[test]
++    fn a_worker_keeps_its_buffers_but_not_a_huge_one() {
++        let mut scratch = WorkerScratch::default();
++        scratch.source.resize(64 << 10, 0);
++        scratch.intermediate.resize(128 << 10, 0);
++        let (source, intermediate) = (scratch.source.as_ptr(), scratch.intermediate.as_ptr());
++        scratch.trim();
++        assert_eq!(scratch.source.as_ptr(), source);
++        assert_eq!(scratch.intermediate.as_ptr(), intermediate);
++        scratch.source.resize(SCRATCH_KEPT + 4096, 0);
++        scratch.trim();
++        assert_eq!(scratch.source.capacity(), 0);
++        assert_eq!(scratch.intermediate.as_ptr(), intermediate);
++    }
++
+     #[test]
+     fn request_layout_is_the_titles() {
+         assert_eq!(size_of::<Request>(), 0x48);

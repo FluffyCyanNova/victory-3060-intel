@@ -1,0 +1,233 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Thu, 26 Nov 2026 21:53:17 +0800
+Subject: [PATCH 1/3] DirectStorage: the 5 s summary says more, at info level
+ in diagnostics builds
+
+No behaviour change. The summary of the workers (requests, MB/s, busy and
+reading workers, staging waits, BCPack, reads waiting) was a debug line
+and so in no run's log. In diagnostics builds it is an info line now, and
+it also says: reads running, the longest a read waited from its submission
+to its start, how long the title's threads were blocked on a full queue,
+and the time spent inflating zlib, mapping/committing/unmapping our own
+views of physical pages, and telling the GPU side of the bytes written.
+To tell a title that asks slowly from an emulation that answers slowly.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-hle/src/modules/dstorage.rs | 69 ++++++++++++++++++----
+ crates/victory-hle/src/modules/xmem.rs     | 25 ++++++++
+ 2 files changed, 81 insertions(+), 13 deletions(-)
+
+diff --git a/crates/victory-hle/src/modules/dstorage.rs b/crates/victory-hle/src/modules/dstorage.rs
+index 8208880eb..4669fda01 100644
+--- a/crates/victory-hle/src/modules/dstorage.rs
++++ b/crates/victory-hle/src/modules/dstorage.rs
+@@ -358,8 +358,17 @@ struct Lanes {
+     /// BCPack bytes written and time spent on them.
+     bcpack: (u64, std::time::Duration),
+     since: Option<std::time::Instant>,
++    /// For the summary: when each read not yet started was submitted, and
++    /// the longest any read started since the last summary had waited.
++    submitted: HashMap<u64, std::time::Instant>,
++    longest: std::time::Duration,
+ }
+ 
++/// Nanoseconds since the last summary, for it: the title's threads blocked
++/// on a full queue ([`queue`]), and workers inflating zlib.
++static BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
++static ZLIB_NS: AtomicU64 = AtomicU64::new(0);
++
+ /// A queue's requests in the scheduler.
+ struct Lane {
+     class: usize,
+@@ -415,6 +424,8 @@ fn scheduler() -> Option<&'static Scheduler> {
+                     refused: 0,
+                     bcpack: Default::default(),
+                     since: None,
++                    submitted: HashMap::new(),
++                    longest: Default::default(),
+                 }),
+                 work: Condvar::new(),
+                 finished: Condvar::new(),
+@@ -524,20 +535,35 @@ impl Lanes {
+         let since = *self.since.get_or_insert(started);
+         let elapsed = since.elapsed();
+         if elapsed.as_secs() >= 5 {
++            let secs = elapsed.as_secs_f64();
+             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
++            let running: usize = self.lanes.values().map(|l| l.running.len()).sum();
+             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+-            tracing::debug!(
+-                requests = *requests,
+-                mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
+-                busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
+-                reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
+-                staging_waits = std::mem::take(&mut self.refused),
+-                bcpack_mb = self.bcpack.0 / 1_000_000,
+-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+-                waiting,
+-                "dstorage: last {:.1} s",
+-                elapsed.as_secs_f64()
++            let ms = |ns: &AtomicU64| ns.swap(0, Ordering::Relaxed) as f64 / 1e6;
++            // Info in diagnostics builds (it is how a run's streaming pace
++            // is read), debug otherwise. Times are summed over all workers.
++            let line = format!(
++                "dstorage: last {secs:.1} s: requests={} mb_per_s={:.1} busy_workers={:.2} reading_workers={:.2} staging_waits={} \
++                 bcpack_mb={} bcpack_workers={:.2} waiting={waiting} running={running} longest_wait_ms={} title_blocked_ms={:.0} \
++                 zlib_ms={:.0} view_ms={:.0} pages_written_ms={:.0}",
++                *requests,
++                *bytes as f64 / secs / 1e6,
++                busy.as_secs_f64() / secs,
++                reading / secs,
++                std::mem::take(&mut self.refused),
++                self.bcpack.0 / 1_000_000,
++                self.bcpack.1.as_secs_f64() / secs,
++                std::mem::take(&mut self.longest).as_millis(),
++                ms(&BLOCKED_NS),
++                ms(&ZLIB_NS),
++                ms(&super::xmem::VIEW_NS),
++                ms(&super::xmem::WRITTEN_NS),
+             );
++            if cfg!(feature = "diagnostics") {
++                tracing::info!("{line}");
++            } else {
++                tracing::debug!("{line}");
++            }
+             self.done = Default::default();
+             self.bcpack = Default::default();
+             self.since = None;
+@@ -564,6 +590,9 @@ impl Lanes {
+         }
+         lane.reads.pop_front();
+         lane.running.insert(seq);
++        if let Some(at) = self.submitted.remove(&seq) {
++            self.longest = self.longest.max(at.elapsed());
++        }
+         self.staged += staging;
+         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
+         self.now = self.clock[class];
+@@ -613,7 +642,10 @@ impl Lanes {
+             let seq = self.next_seq;
+             self.next_seq += 1;
+             match command {
+-                Command::Read(request) => lane.reads.push_back((seq, request)),
++                Command::Read(request) => {
++                    self.submitted.insert(seq, std::time::Instant::now());
++                    lane.reads.push_back((seq, request));
++                }
+                 Command::Status(status) => lane.statuses.push_back((seq, status)),
+             }
+         }
+@@ -681,11 +713,15 @@ fn close_lane(id: u64) {
+         return;
+     };
+     let mut lanes = scheduler.lock();
+-    let Some(lane) = lanes.lanes.get_mut(&id) else {
++    let all = &mut *lanes;
++    let Some(lane) = all.lanes.get_mut(&id) else {
+         return;
+     };
+     lane.closed = true;
+     lane.unsubmitted.clear();
++    for (seq, _) in &lane.reads {
++        all.submitted.remove(seq);
++    }
+     lane.reads.clear();
+     lane.statuses.clear(); // releases their arrays
+     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
+@@ -789,6 +825,8 @@ fn queue(this: QueueRef, command: Command) {
+         return;
+     };
+     let mut lanes = scheduler.lock();
++    // (For the summary: how long the title's thread waits here.)
++    let mut blocked: Option<super::xmem::Timed> = None;
+     loop {
+         let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
+             return; // closed: dropped (a status releases its array)
+@@ -797,11 +835,13 @@ fn queue(this: QueueRef, command: Command) {
+         if lane.entries() + 1 < lane.capacity.max(2) {
+             break;
+         }
++        let _ = blocked.get_or_insert_with(|| super::xmem::Timed::start(&BLOCKED_NS));
+         lanes = scheduler
+             .finished
+             .wait(lanes)
+             .unwrap_or_else(|e| e.into_inner());
+     }
++    drop(blocked);
+     let Some(lane) = lanes.lanes.get_mut(&id) else {
+         return;
+     };
+@@ -917,6 +957,7 @@ fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
+         static INFLATE: std::cell::RefCell<zlib_rs::Inflate> =
+             std::cell::RefCell::new(zlib_rs::Inflate::new(true, 15));
+     }
++    let _timed = super::xmem::Timed::start(&ZLIB_NS);
+     INFLATE.with_borrow_mut(|state| {
+         state.reset(true);
+         // `Inflate::decompress` cannot distinguish a valid empty stream from
+@@ -1445,6 +1486,8 @@ mod tests {
+             refused: 0,
+             bcpack: Default::default(),
+             since: None,
++            submitted: HashMap::new(),
++            longest: Default::default(),
+         }
+     }
+ 
+diff --git a/crates/victory-hle/src/modules/xmem.rs b/crates/victory-hle/src/modules/xmem.rs
+index b17f0e587..74adc84fa 100644
+--- a/crates/victory-hle/src/modules/xmem.rs
++++ b/crates/victory-hle/src/modules/xmem.rs
+@@ -494,6 +494,7 @@ impl View {
+     /// Maps `n` slices from `slice` on.
+     fn map(slice: &Slice, n: usize) -> Option<View> {
+         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
++        let _timed = Timed::start(&VIEW_NS);
+         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
+         // SAFETY: slices of a section we own; the view is ours until dropped.
+         let at = unsafe {
+@@ -523,11 +524,34 @@ impl View {
+ impl Drop for View {
+     fn drop(&mut self) {
+         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
++        let _timed = Timed::start(&VIEW_NS);
+         // SAFETY: our view.
+         unsafe { UnmapViewOfFile(self.at) };
+     }
+ }
+ 
++/// Nanoseconds spent, for DirectStorage's summary line (counts only): in
++/// mapping, committing and unmapping views of our own on physical pages,
++/// and in telling the GPU side of the bytes written through them
++/// ([`pages_written`]).
++pub(crate) static VIEW_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++pub(crate) static WRITTEN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++/// Adds the time it lives to a counter of nanoseconds.
++pub(crate) struct Timed(&'static std::sync::atomic::AtomicU64, std::time::Instant);
++
++impl Timed {
++    pub(crate) fn start(to: &'static std::sync::atomic::AtomicU64) -> Timed {
++        Timed(to, std::time::Instant::now())
++    }
++}
++
++impl Drop for Timed {
++    fn drop(&mut self) {
++        self.0.fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
++    }
++}
++
+ /// The pages behind bytes `[offset, offset + len)` of `pages` (64 KiB
+ /// each), as runs of consecutive slices of one section: each run's first
+ /// slice and its length in pages. One look at the page table, which the
+@@ -660,6 +684,7 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
+ /// the bytes are there, and without the page table's lock ([`shown_at`]
+ /// takes and leaves it).
+ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
++    let _timed = Timed::start(&WRITTEN_NS);
+     for (at, bytes) in shown_at(pages, offset, len) {
+         victory_gpu::title_memory_written(at, bytes, true);
+     }

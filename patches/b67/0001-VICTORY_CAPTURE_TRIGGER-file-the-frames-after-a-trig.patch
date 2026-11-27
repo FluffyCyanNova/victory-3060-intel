@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Sat, 28 Nov 2026 00:39:49 +0800
+Subject: [PATCH 1/2] VICTORY_CAPTURE_TRIGGER=<file>: the frames after a
+ trigger are listed frames
+
+Off when unset. At each present the file is looked for (one call); when
+it appears, or is written again (its time changes), the next three
+frames are listed frames: each gets its frame-<n>-ops.txt (one line per
+draw, dispatch, copy and drop, with the pipeline, the shaders, the
+targets and the state), its picture, and with VICTORY_DUMP_TARGETS its
+targets. A file that is there at the first present is from an earlier
+run and triggers nothing. The file is never changed by us.
+
+Why: stretched meshes show at moments nobody can name beforehand, so a
+fixed list of frames misses them, and keeping every frame's operations
+would format a text for each of some 50,000 commands a frame. Whoever
+sees one writes the file; the frames right after it are on disk.
+
+A listed frame is presented the slow way, as before.
+
+Tests (diagnostics builds, where the module is): the three frames of a
+trigger; a file counts when it appears or changes after the first look.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+(cherry picked from commit 5caa8dc04dd05472b7e602a5a33c9f1142ea668b)
+---
+ crates/victory-gpu/src/capture.rs | 91 ++++++++++++++++++++++++++++++-
+ 1 file changed, 90 insertions(+), 1 deletion(-)
+
+diff --git a/crates/victory-gpu/src/capture.rs b/crates/victory-gpu/src/capture.rs
+index bc854340b..a0ba48aae 100644
+--- a/crates/victory-gpu/src/capture.rs
++++ b/crates/victory-gpu/src/capture.rs
+@@ -47,7 +47,65 @@ pub(crate) fn listed(n: u64) -> bool {
+     });
+     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+     let after = n.wrapping_sub(first);
+-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
++    named
++        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
++        || in_window(TRIGGERED.load(std::sync::atomic::Ordering::Relaxed), n)
++}
++
++/// The first of the frames a trigger listed ([`trigger_poll`]);
++/// `u64::MAX`: none.
++static TRIGGERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
++
++/// The frames a trigger lists: this many from the one after the present
++/// that saw it.
++const TRIGGER_FRAMES: u64 = 3;
++
++/// Whether frame `n` is one of the [`TRIGGER_FRAMES`] frames from `from`
++/// on (`u64::MAX`: no trigger yet).
++fn in_window(from: u64, n: u64) -> bool {
++    from != u64::MAX && n >= from && n - from < TRIGGER_FRAMES
++}
++
++/// Whether a trigger file whose time is `now` (`None`: no file) is a new
++/// trigger, given what was `seen` before (`None`: never looked). The
++/// first look only notes what is there: a file left by an earlier run
++/// triggers nothing. After that, a file that appears or whose time has
++/// changed is a trigger; one that went away is not.
++fn fresh<T: PartialEq + Copy>(seen: Option<Option<T>>, now: Option<T>) -> bool {
++    match (seen, now) {
++        (None, _) | (_, None) => false,
++        (Some(before), Some(time)) => before != Some(time),
++    }
++}
++
++/// `VICTORY_CAPTURE_TRIGGER=<file>`: at each present the file is looked
++/// for; when it appears, or is written again (its time changes), the next
++/// [`TRIGGER_FRAMES`] frames are listed frames: each gets its
++/// `frame-<n>-ops.txt` (one line per draw, dispatch, copy and drop, with
++/// the pipeline, the shaders, the targets and the state: [`op`]), its
++/// picture, and with `VICTORY_DUMP_TARGETS` its targets. For what shows
++/// at moments nobody can name beforehand (a stretched mesh): whoever sees
++/// it writes the file, and the frames right after it are on disk. Nothing
++/// is kept or formatted until then; the file is never changed by us.
++/// Off when unset. A listed frame is presented the slow way.
++pub(crate) fn trigger_poll(frame: u64) {
++    static FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
++    let Some(path) = FILE.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_TRIGGER").map(PathBuf::from)) else {
++        return;
++    };
++    static SEEN: std::sync::Mutex<Option<Option<std::time::SystemTime>>> = std::sync::Mutex::new(None);
++    let now = std::fs::metadata(path).and_then(|m| m.modified()).ok();
++    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
++    let new = fresh(*seen, now);
++    *seen = Some(now);
++    if new {
++        TRIGGERED.store(frame + 1, std::sync::atomic::Ordering::Relaxed);
++        tracing::info!(
++            first = frame + 1,
++            last = frame + TRIGGER_FRAMES,
++            "capture trigger: these frames are listed, their operations written out (VICTORY_CAPTURE_TRIGGER)"
++        );
++    }
+ }
+ 
+ /// With a capture folder, for the frames [`listed`]: `what` is added to
+@@ -126,6 +184,7 @@ static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u
+ /// At the present of `frame`: the draws run on the host so far.
+ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
+     use std::sync::atomic::Ordering::Relaxed;
++    trigger_poll(frame);
+     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+     let before = LAST.swap(drawn, Relaxed);
+     FRAME_DRAWS.store(drawn.saturating_sub(before), Relaxed);
+@@ -849,6 +908,36 @@ pub(crate) fn recent_levels() -> Vec<u8> {
+ 
+ #[cfg(test)]
+ mod tests {
++    /// A trigger lists the three frames from the one it names.
++    #[test]
++    fn a_trigger_lists_its_three_frames_and_no_others() {
++        assert!(!super::in_window(u64::MAX, 0));
++        assert!(!super::in_window(u64::MAX, u64::MAX));
++        assert!(!super::in_window(100, 99));
++        assert!(super::in_window(100, 100));
++        assert!(super::in_window(100, 102));
++        assert!(!super::in_window(100, 103));
++    }
++
++    /// The first look at the trigger file only notes it; later a file that
++    /// appears or is written again is a trigger, one that stays or goes is
++    /// not.
++    #[test]
++    fn a_trigger_file_counts_when_it_appears_or_changes_after_the_first_look() {
++        use super::fresh;
++        // First look: whatever is there is from before.
++        assert!(!fresh::<u32>(None, None));
++        assert!(!fresh(None, Some(5)));
++        // No file before, one now.
++        assert!(fresh(Some(None), Some(5)));
++        // The same file, untouched; then written again.
++        assert!(!fresh(Some(Some(5)), Some(5)));
++        assert!(fresh(Some(Some(5)), Some(6)));
++        // The file went away.
++        assert!(!fresh(Some(Some(5)), None));
++        assert!(!fresh::<u32>(Some(None), None));
++    }
++
+     #[test]
+     fn crc_matches_the_png_check_value() {
+         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+-- 
+2.56.0.windows.3
+

@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Fri, 27 Nov 2026 23:42:26 +0800
+Subject: [PATCH 09/13] VICTORY_NAN_SCRUB=1: infinities and NaNs a shader hands
+ on are written as 0
+
+Off by default; unset, nothing more is emitted (scrub() returns its
+value as it is). With the switch on, a float whose bits are those of an
+infinity or a NaN becomes 0.0 in two places:
+- the float colours a pixel shader exports (Target::Color),
+- the four values of a float image store (textureStore.f32).
+The test is on the bits ((bits & 0x7FFFFFFF) >= 0x7F800000), the shape
+is_nan_f32 already has: a float compare may be folded away by a host
+compiler that takes floats to be finite.
+
+Why: one such value in a target that later passes read (blur, exposure,
+history) spreads as black or flat-coloured patches.
+
+Origin of the idea: trustno1-coder/VIctory-NVIDIA, commit 77e13a974
+(GPL-3.0-or-later); written anew here. Not taken: its fog-volume part.
+
+The switch name is quoted in the shader crate, so build.rs puts it in
+the translator fingerprint and the shader cache keys on it.
+
+Tests: scrub_tests (2). Corpus (533, VICTORY_HOST_WAVE=32): 532
+validated with the switch off and with it on (f133e35e fails as before);
+on, 519 colour values and 4,644 image-store values are scrubbed; off, none.
+
+(Re-applied by hand from 477e62e97 onto the split of lower.rs: the
+image-store part is in lower_image.rs now; the same 68 lines.)
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-shader/src/emit/lower.rs       |  2 +
+ crates/victory-shader/src/emit/lower_image.rs |  3 +
+ crates/victory-shader/src/emit/lower_local.rs | 63 +++++++++++++++++++
+ 3 files changed, 68 insertions(+)
+
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index cee50941c..5bc6fa548 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -9727,6 +9727,8 @@ impl<'a> Lower<'a> {
+                 }
+                 _ => (".i32", x),
+             };
++            let colour = self.s.pixel && suffix == ".f32" && matches!(e.target, Target::Color(_));
++            let x = if colour { self.scrub(x) } else { x };
+             let mut args = vec![
+                 self.s.m.i32(id as u32),
+                 self.s.m.i32(0),
+diff --git a/crates/victory-shader/src/emit/lower_image.rs b/crates/victory-shader/src/emit/lower_image.rs
+index 523a2ba69..2d2a7400a 100644
+--- a/crates/victory-shader/src/emit/lower_image.rs
++++ b/crates/victory-shader/src/emit/lower_image.rs
+@@ -220,6 +220,9 @@ impl Lower<'_> {
+                     self.float_of(v)?
+                 });
+             }
++            for v in &mut vals {
++                *v = self.scrub(*v);
++            }
+             let h = self.handle(site, src, false, props)?;
+             let at = self.begin_guarded(guard);
+             let mut args = vec![h];
+diff --git a/crates/victory-shader/src/emit/lower_local.rs b/crates/victory-shader/src/emit/lower_local.rs
+index 673a790eb..60146c03e 100644
+--- a/crates/victory-shader/src/emit/lower_local.rs
++++ b/crates/victory-shader/src/emit/lower_local.rs
+@@ -451,3 +451,66 @@ mod ticket_card_tests {
+         }
+     }
+ }
++
++/// Whether floats that are not finite numbers are written as 0 where a
++/// shader hands them on (`VICTORY_NAN_SCRUB=1`; off by default): the
++/// colours a pixel shader exports and the values of float image stores.
++/// One such value in a target that later passes read (blur, exposure,
++/// temporal history) turns into black or flat-coloured patches that
++/// spread; the console's own targets often clamp where the host's do not.
++///
++/// The idea is from trustno1-coder/VIctory-NVIDIA, commit 77e13a974
++/// (GPL-3.0-or-later); written anew here.
++pub(crate) fn nan_scrub() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("VICTORY_NAN_SCRUB").is_ok_and(|v| v.trim() == "1"))
++}
++
++/// Whether `bits` is the pattern of an infinity or a NaN: what
++/// [`Lower::scrub`] has the shader test.
++#[cfg(test)]
++fn not_finite(bits: u32) -> bool {
++    bits & 0x7FFF_FFFF >= 0x7F80_0000
++}
++
++impl Lower<'_> {
++    /// `f`, or 0 where it is an infinity or a NaN, with [`nan_scrub`];
++    /// `f` itself and nothing emitted without.
++    pub(super) fn scrub(&mut self, f: V) -> V {
++        if nan_scrub() { self.scrubbed(f) } else { f }
++    }
++
++    /// 0 where `f` is an infinity or a NaN, else `f`. On the bits: a
++    /// float compare may be folded away by a host compiler that takes
++    /// floats to be finite.
++    fn scrubbed(&mut self, f: V) -> V {
++        let c = self.cur;
++        let bits = self.as_int(f);
++        let mask = self.s.m.i32(0x7FFF_FFFF);
++        let abs = self.s.m.bin(c, Bin::And, bits, mask);
++        let inf = self.s.m.i32(0x7F80_0000);
++        let bad = self.s.m.cmp(c, pred::IUGE, abs, inf);
++        let zero = self.s.m.f32(0);
++        self.s.m.select(c, bad, zero, f)
++    }
++}
++
++#[cfg(test)]
++mod scrub_tests {
++    use super::not_finite;
++
++    #[test]
++    fn infinities_and_nans_are_the_values_scrubbed() {
++        for bad in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN, -f32::NAN] {
++            assert!(not_finite(bad.to_bits()), "{bad}");
++        }
++        assert!(not_finite(0x7F80_0001) && not_finite(0xFFFF_FFFF));
++    }
++
++    #[test]
++    fn numbers_are_left_alone() {
++        for fine in [0.0, -0.0, 1.0, -1.0, f32::MAX, f32::MIN, f32::MIN_POSITIVE, 1e-45] {
++            assert!(!not_finite(fine.to_bits()), "{fine}");
++        }
++    }
++}
+-- 
+2.56.0.windows.3
+

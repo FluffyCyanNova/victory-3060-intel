@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 08:34:30 +0800
+Subject: [PATCH 01/43] Local: compute programs with implicit derivatives
+ declare validator 1.8
+
+Validators treat dx.valver below 1.8 as 'derivative operations are not for compute' (Sample, SampleBias, SampleCmp, CalculateLOD), so 220 of the failed corpus's compute programs were refused as incompatible with their stage. Those programs alone now carry dx.valver 1.8 and PSV0 runtime info 3 (the entry's name); every other program stays on 1.6.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-shader/src/emit/container.rs | 13 +++++++++++--
+ crates/victory-shader/src/emit/lower.rs     |  3 +++
+ crates/victory-shader/src/emit/shader.rs    | 17 ++++++++++++++++-
+ 3 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/crates/victory-shader/src/emit/container.rs b/crates/victory-shader/src/emit/container.rs
+index 3c346d9a6..69129a953 100644
+--- a/crates/victory-shader/src/emit/container.rs
++++ b/crates/victory-shader/src/emit/container.rs
+@@ -161,6 +161,8 @@ pub(crate) struct Psv<'a> {
+     /// Compute: thread-group size and required wave size.
+     pub threads: [u32; 3],
+     pub wave_size: Option<u32>,
++    /// Runtime info version 3 (validator 1.8): the entry function's name.
++    pub entry: Option<&'a str>,
+ }
+ 
+ /// `PSV0` with runtime info version 2 (validator 1.6).
+@@ -179,8 +181,9 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
+             out.extend(v.to_le_bytes());
+         }
+     };
+-    u32s(&mut out, &[48]);
+-    let mut info = [0u8; 48];
++    let size = if p.entry.is_some() { 52 } else { 48 };
++    u32s(&mut out, &[size as u32]);
++    let mut info = vec![0u8; size];
+     info[0] = u8::from(p.flag);
+     if p.stage == 0 {
+         // PSInfo.SampleFrequency: an input interpolated per sample, or the
+@@ -232,6 +235,12 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
+     }
+     // Names of arbitrary semantics (system values use ""), then indices.
+     let mut strings = vec![0u8];
++    if let Some(entry) = p.entry {
++        // The info was written first, after the size dword.
++        let at = strings.len() as u32;
++        out[4 + 48..4 + 52].copy_from_slice(&at.to_le_bytes());
++        strings.extend(entry.bytes().chain([0]));
++    }
+     let mut indices: Vec<u32> = Vec::new();
+     let mut elements = Vec::new();
+     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 63c4de742..99bece352 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -9618,6 +9618,9 @@ impl<'a> Lower<'a> {
+             "image_get_resinfo" => (72, false),
+             _ => return Err(name),
+         };
++        if matches!(op, 60 | 61 | 64 | 81) && !self.s.pixel {
++            self.s.flags |= flags::DERIVATIVES;
++        }
+         if op == 72 {
+             // Width, height, depth or layers, levels (per dmask) of the level
+             // in the first address: DXIL's dimensions; a channel DXIL leaves
+diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
+index 28a36f1be..ce2a0887f 100644
+--- a/crates/victory-shader/src/emit/shader.rs
++++ b/crates/victory-shader/src/emit/shader.rs
+@@ -83,6 +83,8 @@ pub(crate) mod flags {
+     pub const ATOMIC_HEAP64: u64 = 1 << 32;
+     pub const RESOURCE_HEAP: u64 = 1 << 30;
+     pub const SAMPLER_HEAP: u64 = 1 << 31;
++    /// Ours, not DXIL's: implicit derivatives outside a pixel shader.
++    pub const DERIVATIVES: u64 = 1 << 63;
+ }
+ 
+ pub(crate) struct Types {
+@@ -691,6 +693,12 @@ impl Shader {
+         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
+             self.flags |= flags::STENCIL_REF;
+         }
++        // Derivatives in compute need validator 1.8 (older ones refuse them
++        // outside pixel shaders); every other program stays on 1.6. The
++        // bit is ours alone: the metadata's flags leave it out.
++        let compute = self.threads.is_some() && self.mesh.is_none() && self.geometry.is_none();
++        let v18 = compute && self.flags & flags::DERIVATIVES != 0;
++        self.flags &= !flags::DERIVATIVES;
+         // Entry properties: shader flags (tag 0), geometry state (1),
+         // thread-group size (4), wave size (11).
+         let mut props = Vec::new();
+@@ -752,7 +760,13 @@ impl Shader {
+         let six = i32c(&mut self, 6);
+         let version = self.m.md_node(vec![Some(one), Some(six)]);
+         self.m.named_md("dx.version", vec![version]);
+-        self.m.named_md("dx.valver", vec![version]);
++        let valver = if v18 {
++            let eight = i32c(&mut self, 8);
++            self.m.md_node(vec![Some(one), Some(eight)])
++        } else {
++            version
++        };
++        self.m.named_md("dx.valver", vec![valver]);
+         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
+         let (name, kind) = match (self.threads, self.pixel) {
+             _ if self.mesh.is_some() => ("ms", 13u32),
+@@ -827,6 +841,7 @@ impl Shader {
+             bindings: &bindings,
+             threads: self.threads.unwrap_or_default(),
+             wave_size: self.wave_size,
++            entry: v18.then_some("main"),
+         });
+         let hash = [0u8; 20];
+         let psg1 = container::signature(&self.prims, false);

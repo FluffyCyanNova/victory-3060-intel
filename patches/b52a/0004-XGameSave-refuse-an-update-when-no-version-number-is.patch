@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 16:02:18 +0100
+Subject: [PATCH 4/6] XGameSave: refuse an update when no version number is
+ above the highest (#2497)
+
+With a stray `v18446744073709551615` folder next to a committed `v1`, the
+next number `highest + 1` overflowed: a debug build panicked, and a release
+build wrapped to 0, committed `v0` (not canonical, so never read), returned
+S_OK and removed `v1`, losing the save. The number now comes from
+`checked_add`; with none, the update returns NO_ACCESS, as for a container
+with no readable version, before anything is written or removed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit b730d1e5ffd5173146b5ba745cdc3dd4f64c99a9)
+---
+ crates/victory-hle/src/modules/xgamesave.rs | 22 ++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/crates/victory-hle/src/modules/xgamesave.rs b/crates/victory-hle/src/modules/xgamesave.rs
+index a3fb2f0c2..929256bbc 100644
+--- a/crates/victory-hle/src/modules/xgamesave.rs
++++ b/crates/victory-hle/src/modules/xgamesave.rs
+@@ -514,7 +514,12 @@ impl Update {
+         }
+         let display = self.display.as_deref();
+         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
+-        let number = current.as_ref().map_or(1, |v| v.highest + 1);
++        // A stray `v18446744073709551615` is the highest number: nothing is above it, so the
++        // update is refused before anything is written or removed. `+ 1` wrapped to `v0`,
++        // which is not read, and then removed the committed version (#2497).
++        let Some(number) = current.as_ref().map_or(Some(1), |v| v.highest.checked_add(1)) else {
++            return NO_ACCESS;
++        };
+         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
+             return io_error(&self.dir, &e);
+         }
+@@ -1554,6 +1559,21 @@ mod tests {
+         }
+     }
+ 
++    /// A stray folder with the highest version number leaves no number for an
++    /// update: it is refused, and the committed save stays readable (#2497).
++    #[test]
++    fn no_version_above_the_highest_number_is_refused_and_kept() {
++        let dir = tempfile::tempdir().unwrap();
++        let root = dir.path();
++        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
++        let slot = container_dir(root, "Slot");
++        std::fs::create_dir(slot.join(format!("v{}", u64::MAX))).unwrap();
++        assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
++        assert_eq!(state(root), old_state());
++        assert!(slot.join("v1").is_dir());
++        assert!(!slot.join("v0").exists());
++    }
++
+     /// With no readable version at all, reads and updates fail and nothing
+     /// is removed.
+     #[test]

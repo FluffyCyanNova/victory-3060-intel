@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Thu, 26 Nov 2026 15:33:58 +0800
+Subject: [PATCH 34/43] GPU: VICTORY_BACK_QUIET=1 (hand port of fork #1188; NOT
+ YET COMPILED)
+
+A copy-back's own write into private, write-watched title memory reads
+as a title write at the next refresh, and the copy takes its own output
+in again. With VICTORY_BACK_QUIET=1 (off by default) the write is made
+as before, the kernel's write-watch bits of its pages are reset (only if
+none was set before the write), the journal is told (watch::wrote_own)
+so other copies take the pages, and the writing copy notes itself
+current.
+
+Hand port: fork #1188 (0460bf53) sits on the fork's own-view copy-back
+(put_back_own, shaders_write), which this line does not have, so only
+BACK_QUIET is taken; BACK_OWN_VIEW is not separable from that work.
+Sites: the one write per copy in copy_back_with, and the changed runs of
+relay_merge, card_merge and card_merge_relay (Shadow::write_runs).
+
+Written in a read-only window: not compiled, not tested. Build and
+test before any use.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/shadow.rs | 88 ++++++++++++++++++++++++++++++--
+ crates/victory-gpu/src/watch.rs  | 22 ++++++++
+ 2 files changed, 106 insertions(+), 4 deletions(-)
+
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index 756462d0c..d30b7765e 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -2490,7 +2490,9 @@ impl Shadow {
+                 // stretch is the title's as read, and a title write landing
+                 // there since stays.
+                 for &(off, len) in &runs {
+-                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
++                    if !self.put_back_quiet(start + at + off, &title[off..off + len]) {
++                        crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
++                    }
+                     written += len;
+                 }
+             }
+@@ -2581,6 +2583,9 @@ impl Shadow {
+         if !merge_piece(now, held, title) {
+             return 0;
+         }
++        if self.put_back_quiet(start + at, &title[..]) {
++            return n;
++        }
+         crate::watch::writing(start + at, n);
+         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
+         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+@@ -3201,9 +3206,11 @@ impl Shadow {
+                 *o = merged;
+             }
+             if differs != 0 {
+-                crate::watch::writing(start + at, n);
+-                merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
+-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
++                if !self.put_back_quiet(start + at, &title[..]) {
++                    crate::watch::writing(start + at, n);
++                    merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
++                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
++                }
+                 written = n;
+             }
+         } else {
+@@ -3280,6 +3287,9 @@ impl Shadow {
+         if !mapped || !changed {
+             return 0;
+         }
++        if self.put_back_quiet(start + at, &title[..]) {
++            return n;
++        }
+         crate::watch::writing(start + at, n);
+         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
+         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+@@ -3287,6 +3297,76 @@ impl Shadow {
+     }
+ }
+ 
++/// `VICTORY_BACK_QUIET=1`: see [`Shadow::put_back_quiet`]. Off by default.
++fn quiet_back() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_QUIET").is_some_and(|v| v == "1"))
++}
++
++/// Quiet copy-backs since the start: bytes, stretches written the old way,
++/// stretches written quietly.
++static QUIET: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
++
++impl Shadow {
++    /// (hand port of fork #1188, `VICTORY_BACK_QUIET=1`, off by default)
++    /// What a merge made of private, write-watched title memory
++    /// `[at, at + bytes.len())` is written as before, then the kernel's
++    /// write-watch bits of those pages are reset, so the write does not
++    /// read as the title's; the journal is told the pages changed
++    /// (`watch::wrote_own`), so every other copy that holds them takes them
++    /// again, and this copy, which holds them already, notes itself current
++    /// instead of taking its own output in again (the fork's read census,
++    /// #1169: about 92% of the layer's touches of copied-back pages).
++    /// False with nothing written if the switch is off, the pages are not
++    /// write-watched, or the title wrote one of them since the last asking
++    /// (its bit would be reset too): the caller writes as before.
++    /// shortcut: a title write to one of the pages between the write and
++    /// the reset is lost to the write-watch.
++    fn put_back_quiet(&self, at: usize, bytes: &[u8]) -> bool {
++        use windows_sys::Win32::System::Memory::{GetWriteWatch, ResetWriteWatch};
++        if !quiet_back() || bytes.is_empty() {
++            return false;
++        }
++        let first = at & !4095;
++        let end = (at + bytes.len()).next_multiple_of(4096);
++        let mut found = [std::ptr::null_mut::<std::ffi::c_void>(); 32];
++        let mut count = found.len();
++        let mut granularity = 0u32;
++        // SAFETY: a query of title memory into arrays of ours.
++        let asked = unsafe { GetWriteWatch(0, first as _, end - first, found.as_mut_ptr(), &mut count, &mut granularity) };
++        if asked != 0 || count != 0 {
++            QUIET[1].fetch_add(1, Ordering::Relaxed);
++            return false;
++        }
++        crate::watch::writing(at, bytes.len());
++        crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
++        // SAFETY: the same write-watched pages.
++        unsafe { ResetWriteWatch(first as _, end - first) };
++        crate::descriptor::host::remapped(at, bytes.len());
++        let base = self.start as usize / PAGE;
++        for page in at / PAGE..(at + bytes.len()).div_ceil(PAGE) {
++            let (before, now) = crate::watch::wrote_own(page);
++            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
++            if let Some(taken) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
++                && *taken != 0
++                && *taken >= before
++            {
++                *taken = (*taken).max(now);
++            }
++        }
++        QUIET[0].fetch_add(bytes.len() as u64, Ordering::Relaxed);
++        let n = QUIET[2].fetch_add(1, Ordering::Relaxed) + 1;
++        if n.is_multiple_of(16384) {
++            tracing::info!(
++                "copy-backs written quietly (VICTORY_BACK_QUIET=1) since the start: {n} stretches {} MB; written the old way (not write-watched, or the title had written there): {}",
++                QUIET[0].load(Ordering::Relaxed) >> 20,
++                QUIET[1].load(Ordering::Relaxed)
++            );
++        }
++        true
++    }
++}
++
+ struct Entry {
+     end: u64,
+     shadow: Option<Arc<Shadow>>,
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index 02d066f29..e323e5202 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -253,6 +253,28 @@ pub(crate) fn wrote(at: usize, len: usize) {
+     }
+ }
+ 
++/// (port of fork #1188's part of `wrote_own`) We wrote the 64 KiB page
++/// numbered `page` of title memory ourselves and reset the kernel's
++/// write-watch bits behind the write (`Shadow::put_back_quiet`), so the
++/// journal is told here: the page counts as written at a new asking, which
++/// every host copy that holds it takes at its next refresh. Returns the
++/// asking that had last found `page` written (0: never) and the new one,
++/// for the copy that wrote to note itself current.
++pub(crate) fn wrote_own(page: usize) -> (u64, u64) {
++    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
++    let j = &mut *j;
++    j.asked += 1;
++    let now = j.asked;
++    // As in [`wrote`]: an asking that stands for a submission, or for a
++    // flush, moves with it, or a copy taking the page at the standing
++    // asking would find it written "later" at every refresh.
++    if j.kept || !j.ahead.is_empty() {
++        j.ahead_asked = now;
++    }
++    let before = j.written.insert(page, now).unwrap_or(0);
++    (before, now)
++}
++
+ /// One kernel asking for `pieces` (page ranges in order); by halves if it
+ /// fails, as a run across two reservations or into memory that is not
+ /// write-watched does. A piece alone is left to [`writes`].

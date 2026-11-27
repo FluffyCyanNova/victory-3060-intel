@@ -1,0 +1,433 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 05:26:33 +0000
+Subject: [PATCH 05/43] Shaders: a sampler chosen by control flow between two
+ immediate samplers
+
+The title's programs pick an address mode by control flow: one of two
+immediate samplers, set in SGPRs on each side of a branch, reaches the
+sample through a phi. `descriptor_phi` takes heap-index sources only, so
+these programs stopped with "a descriptor chosen by control flow" (37 pixel
+and 3 mesh programs of the retail pack).
+
+A handle cannot be chosen by control flow (the validator: "Resource handle
+should returned by createHandle"), and a shader sampler range cannot span
+two static samplers (D3D12 refuses the pipeline). So the sample is made
+through each of the two static samplers and each result channel picked by a
+bit made at the join. A phi of one immediate sampler is that sampler.
+
+- lower: `immediate_sampler_pair` gives the two handles and the bit;
+  `image` emits the sample op once more through the second handle
+  (`Module::call_with`) and selects per channel; `calculateLOD` likewise.
+- bitcode: `Module::call_with`, a copy of a call with one argument replaced.
+- A draw test: a branch on a root constant picks a wrapping or a clamping
+  point sampler for a sample at u = 1.25 of a red and a green texel; the
+  draw reads the texel of the chosen one, on hardware and WARP.
+
+(cherry picked from commit 77f83f9819d40030e13bd1ccd4024ff04db24528)
+---
+ crates/victory-shader/src/emit/bitcode.rs     |  14 ++
+ crates/victory-shader/src/emit/lower.rs       |  87 +++++++-
+ crates/victory-shader/src/emit/mod.rs         |   2 +
+ .../src/emit/sampler_choice_tests.rs          | 207 ++++++++++++++++++
+ 4 files changed, 307 insertions(+), 3 deletions(-)
+ create mode 100644 crates/victory-shader/src/emit/sampler_choice_tests.rs
+
+diff --git a/crates/victory-shader/src/emit/bitcode.rs b/crates/victory-shader/src/emit/bitcode.rs
+index eff0ac08a..f0c229ed7 100644
+--- a/crates/victory-shader/src/emit/bitcode.rs
++++ b/crates/victory-shader/src/emit/bitcode.rs
+@@ -448,6 +448,20 @@ impl Module {
+         };
+         self.push(block, ret, Op::Call(i, args))
+     }
++    /// A copy of the call `v` at the end of `block`, with the argument `from`
++    /// replaced by `to`; `None` if `v` is no call or has no such argument.
++    pub fn call_with(&mut self, block: usize, v: V, from: V, to: V) -> Option<V> {
++        let V::Inst(i) = v else { return None };
++        let Inst { ty, op: Op::Call(f, args) } = &self.insts[i as usize] else {
++            return None;
++        };
++        if !args.contains(&from) {
++            return None;
++        }
++        let (ty, f) = (*ty, *f);
++        let args = args.iter().map(|&a| if a == from { to } else { a }).collect();
++        Some(self.push(block, ty, Op::Call(f, args)))
++    }
+     /// A phi at the top of `block`; incoming values come with [`Module::set_phi`].
+     pub fn phi(&mut self, block: usize, ty: Ty) -> V {
+         let i = self.insts.len() as u32;
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index f10c2c2dc..429e90a70 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -6329,6 +6329,12 @@ impl<'a> Lower<'a> {
+                     _ => Err("a typed root view"),
+                 }
+             }
++            // The same immediate sampler on every path is that sampler.
++            Source::Phi { args, .. }
++                if sampler && matches!(&args[..], [Source::Constant(w), rest @ ..] if rest.iter().all(|a| matches!(a, Source::Constant(x) if x == w))) =>
++            {
++                self.handle(site, &args[0], sampler, props)
++            }
+             Source::Phi { block, args } => {
+                 let _ = site;
+                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
+@@ -6362,6 +6368,51 @@ impl<'a> Lower<'a> {
+         }
+     }
+ 
++    /// A sampler chosen by control flow between two immediate samplers (the
++    /// title picks an address mode this way): the handles of the two, and a
++    /// bit made at the join that is set where the second was chosen. A
++    /// handle cannot be chosen by control flow and a shader sampler range
++    /// cannot span two static samplers, so the sample is made through each
++    /// and the result picked ([`Self::image`]). `None` for any other source.
++    fn immediate_sampler_pair(&mut self, site: Site, src: &Source, props: (u32, u32)) -> Result<Option<(V, V, V)>, Why> {
++        let Source::Phi { block, args } = src else {
++            return Ok(None);
++        };
++        let Some(words) = args
++            .iter()
++            .map(|a| match a {
++                Source::Constant(w) => Some(w.clone()),
++                _ => None,
++            })
++            .collect::<Option<Vec<_>>>()
++        else {
++            return Ok(None);
++        };
++        let first = words[0].clone();
++        let Some(second) = words.iter().find(|w| **w != first).cloned() else {
++            return Ok(None);
++        };
++        if words.iter().any(|w| *w != first && *w != second) {
++            return Ok(None);
++        }
++        let a = self.handle(site, &Source::Constant(first), true, props)?;
++        let b = self.handle(site, &Source::Constant(second.clone()), true, props)?;
++        let p = self.x.p;
++        let mut incoming = Vec::new();
++        for (&q, w) in p.blocks[*block].preds.iter().zip(&words) {
++            if self.block[q].is_none() {
++                continue;
++            }
++            let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
++            let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
++            incoming.push((self.s.m.bool(*w == second), at));
++        }
++        let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
++        let take_b = self.s.m.phi(join, self.s.t.i1);
++        self.s.m.set_phi(take_b, incoming);
++        Ok(Some((a, b, take_b)))
++    }
++
+     /// The heap index a descriptor phi picks. Each predecessor computes its
+     /// heap index at its end and the join picks one with a phi; a
+     /// predecessor whose descriptor is itself chosen by control flow (a
+@@ -9663,6 +9714,10 @@ impl<'a> Lower<'a> {
+         let iu = self.s.m.undef(self.s.t.i32);
+         // A gather at a named level, done as four texel reads (below).
+         let mut gathered: Option<[V; 4]> = None;
++        // Two immediate samplers ([`Self::immediate_sampler_pair`]): their
++        // handles and the pick, and the result through the second.
++        let mut other: Option<(V, V, V)> = None;
++        let mut alt: Option<V> = None;
+         let r = if sample {
+             let ss = self
+                 .descriptors
+@@ -9675,7 +9730,16 @@ impl<'a> Lower<'a> {
+             if cmp && (*a16 || dmask.count_ones() != 1) {
+                 return Err("a comparison sample of 16-bit coordinates or several channels");
+             }
+-            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
++            let sampler_props = (14 | if cmp { 0x8000 } else { 0 }, 0);
++            // Two immediate samplers chosen by control flow: the sample
++            // through `sh`, then the same through the other (below).
++            let sh = match self.immediate_sampler_pair(site, ss, sampler_props)? {
++                Some((a, b, take_b)) => {
++                    other = Some((a, b, take_b));
++                    a
++                }
++                None => self.handle(site, ss, true, sampler_props)?,
++            };
+             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
+             // signed (programmable offsets: gathers only).
+             let offset_word = name.ends_with("_o");
+@@ -9740,7 +9804,7 @@ impl<'a> Lower<'a> {
+                 let f32t = self.s.t.f32;
+                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
+                     let clamped = self.s.m.bool(ch == 0);
+-                    let lod = self.s.op(
++                    let mut lod = self.s.op(
+                         c,
+                         "calculateLOD.f32",
+                         Attr::ReadOnly,
+@@ -9748,6 +9812,11 @@ impl<'a> Lower<'a> {
+                         81,
+                         &[h, sh, cs[0], cs[1], cs[2], clamped],
+                     );
++                    if let Some((a, b, take_b)) = other
++                        && let Some(lod_b) = self.s.m.call_with(c, lod, a, b)
++                    {
++                        lod = self.s.m.select(c, take_b, lod_b, lod);
++                    }
+                     let x = self.as_int(lod);
+                     self.write(inst, Reg::V(reg + k as u8), x, guard);
+                 }
+@@ -10082,6 +10151,9 @@ impl<'a> Lower<'a> {
+         let Operand::Vector { reg, .. } = *data else {
+             return Err("an image result");
+         };
++        if let Some((a, b, _)) = other {
++            alt = self.s.m.call_with(c, r, a, b);
++        }
+         let channels: Vec<u32> = if op == 73 {
+             vec![0, 1, 2, 3]
+         } else {
+@@ -10091,7 +10163,16 @@ impl<'a> Lower<'a> {
+         for ch in channels {
+             let x = match gathered {
+                 Some(g) => g[ch as usize],
+-                None => self.s.m.extract(c, r, ch),
++                None => {
++                    let x = self.s.m.extract(c, r, ch);
++                    match (alt, other) {
++                        (Some(rb), Some((_, _, take_b))) => {
++                            let y = self.s.m.extract(c, rb, ch);
++                            self.s.m.select(c, take_b, y, x)
++                        }
++                        _ => x,
++                    }
++                }
+             };
+             xs.push(if *d16 {
+                 // shortcut: d16 results are taken as floats (rounded to
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 5217df8dd..fa966be55 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -92,6 +92,8 @@ mod lower;
+ mod own_bits;
+ mod rect;
+ mod sampler;
++#[cfg(test)]
++mod sampler_choice_tests;
+ mod shader;
+ mod threading;
+ #[cfg(windows)]
+diff --git a/crates/victory-shader/src/emit/sampler_choice_tests.rs b/crates/victory-shader/src/emit/sampler_choice_tests.rs
+new file mode 100644
+index 000000000..bbebdce35
+--- /dev/null
++++ b/crates/victory-shader/src/emit/sampler_choice_tests.rs
+@@ -0,0 +1,207 @@
++//! A sampler chosen by control flow between two immediate samplers
++//! (`Lower::immediate_sampler_pair`): the sample goes through the one the
++//! path chose.
++
++use super::bitcode::{Attr, Term};
++use super::container::{self, SigElement};
++use super::host::{Draw, Host, Root};
++use super::shader::Shader;
++use super::{HostShader, validator};
++use crate::dxbc::{Container, FourCC};
++use crate::native::{
++    HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
++};
++use crate::{io, ir, resource, structure};
++
++/// A pixel program: the texture of the table in user data 0, then by the
++/// constant in user data 2 one of two immediate samplers (point filtering;
++/// wrap where it is not 0, clamp to the last texel where it is), and a
++/// sample at (1.25, 0.5) written to target 0.
++const WORDS: &[u32] = &[
++    0xBE81_0380, // s_mov_b32 s1, 0 (table address high)
++    0xF40C_0200,
++    0xFA00_0000, // s_load_dwordx8 s[8:15], s[0:1], 0
++    0xBF06_8002, // s_cmp_eq_u32 s2, 0
++    0xBF85_0005, // s_cbranch_scc1 -> clamp
++    0xBE90_0380, // s_mov_b32 s16, 0 (wrap)
++    0xBE91_0380, // s_mov_b32 s17, 0
++    0xBE92_0380, // s_mov_b32 s18, 0
++    0xBE93_0380, // s_mov_b32 s19, 0
++    0xBF82_0005, // s_branch -> join
++    0xBE90_03FF,
++    0x0000_0092, // s_mov_b32 s16, 0x92 (clamp to the last texel in x, y, z)
++    0xBE91_0380, // s_mov_b32 s17, 0
++    0xBE92_0380, // s_mov_b32 s18, 0
++    0xBE93_0380, // s_mov_b32 s19, 0
++    0x7E00_02FF,
++    0x3FA0_0000, // v_mov_b32 v0, 1.25
++    0x7E02_02F0, // v_mov_b32 v1, 0.5
++    0xF09C_0F08,
++    0x0082_0400, // image_sample_lz v[4:7], v[0:1], s[8:15], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D
++    0xBF8C_3F70, // s_waitcnt vmcnt(0)
++    0xF800_180F,
++    0x0706_0504, // exp mrt0 v4, v5, v6, v7 done vm
++    0xBF81_0000, // s_endpgm
++];
++
++fn param(root: RootType, user_data: u8, slot: u8) -> RootParam {
++    RootParam {
++        root,
++        table_offset_dwords: 0,
++        sgprs: 1,
++        base_register: 0,
++        user_data,
++        slot,
++    }
++}
++
++fn target() -> SigElement {
++    SigElement {
++        name: "SV_Target".into(),
++        index: 0,
++        kind: 16,
++        comp: 9,
++        interp: 0,
++        row: Some(0),
++        col: 0,
++        cols: 4,
++        usage: 0xF,
++        half: false,
++    }
++}
++
++fn pixel_shader() -> HostShader {
++    let native = NativeProgram {
++        stage: HwStage::Ps,
++        wave64: false,
++        vgprs: 8,
++        layout: vec![param(RootType::Table, 0, 1), param(RootType::Constants, 2, 0)],
++        used: vec![UsedResource {
++            kind: ResourceType::Srv,
++            root: RootType::Table,
++            table_offset_dwords: 0,
++            lower_bound: 0,
++            stride: 8,
++            dwords: 8,
++            user_data: 0,
++            slot: 1,
++        }],
++        io: StageIo::Ps {
++            inputs: Vec::new(),
++            input_addr: 0,
++            db_shader_control: 0,
++            patches: Vec::new(),
++        },
++        code: WORDS.iter().flat_map(|w| w.to_le_bytes()).collect(),
++    };
++    let isg1 = container::signature(&[], true);
++    let osg1 = container::signature(&[target()], false);
++    let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
++    let c = Container::parse(&bytes).unwrap();
++    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
++    let st = structure::structure(&p).unwrap();
++    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
++    let io = io::raise(&p, &native).unwrap();
++    super::emit(&c, &native, &p, &st, &io, &res).unwrap()
++}
++
++/// POSITION to SV_Position.
++fn vertex_shader() -> HostShader {
++    let mut s = Shader::new(false);
++    let b = s.entry;
++    let undef = s.m.undef(s.t.i32);
++    for col in 0..4u8 {
++        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), undef];
++        let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
++        let out = [s.m.i32(0), s.m.i32(0), s.m.i8(col), v];
++        s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &out);
++    }
++    let element = |name: &str, kind, interp| SigElement {
++        name: name.into(),
++        index: 0,
++        kind,
++        comp: 9,
++        interp,
++        row: Some(0),
++        col: 0,
++        cols: 4,
++        usage: 0xF,
++        half: false,
++    };
++    s.inputs.push(element("POSITION", 0, 0));
++    s.outputs.push(element("SV_Position", 3, 4));
++    s.m.terminate(b, Term::Ret);
++    HostShader {
++        stage: HwStage::Vs,
++        dxil: s.finish(),
++        user_data: Vec::new(),
++        samplers: Vec::new(),
++        static_samplers: Vec::new(),
++        root_cbvs: Vec::new(),
++        root_srvs: Vec::new(),
++        root_uavs: Vec::new(),
++        root_indexed_views: Vec::new(),
++    }
++}
++
++#[test]
++fn a_sampler_chosen_by_control_flow_samples_through_the_chosen_one() {
++    let ps = pixel_shader();
++    // Two immediate samplers (static samplers on the host).
++    assert_eq!(ps.static_samplers.len(), 2);
++    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
++        v.validate(&mut ps.dxil.clone()).expect("DXIL validation failed");
++    }
++    let vs = vertex_shader();
++    // A red and a green texel: at u = 1.25, wrapping reads the red one,
++    // clamping the green one.
++    let texels = [[1.0f32, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]];
++    let textures: [(u32, u32, &[[f32; 4]]); 1] = [(2, 1, &texels)];
++    let user_data = |selector: u32| {
++        let mut data = vec![0; ps.user_data_dwords() as usize];
++        for u in &ps.user_data {
++            data[u.index as usize] = match u.root {
++                RootType::Table => 0, // the texture at heap index 0
++                RootType::Constants => selector,
++                other => panic!("unexpected user data {other:?}"),
++            };
++        }
++        data
++    };
++    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
++    let mut ran = 0;
++    for (label, warp) in [("hardware", false), ("warp", true)] {
++        let Ok(host) = Host::new(warp) else {
++            eprintln!("no SM 6.6 {label} device; skipped");
++            continue;
++        };
++        let (root, pso) = host
++            .pipeline(&vs, &ps)
++            .unwrap_or_else(|e| panic!("{label}: graphics pipeline failed: {e}"));
++        for (selector, want) in [(0, texels[1]), (1, texels[0])] {
++            let pixels = host
++                .draw(
++                    &root,
++                    &pso,
++                    &Draw {
++                        roots: vec![
++                            (0, Root::Constants(vec![0])),
++                            (1, Root::Constants(user_data(selector))),
++                        ],
++                        textures: &textures,
++                        samplers: &[],
++                        vertices: &[
++                            -1.0, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0,
++                        ],
++                        stride: 16,
++                        size: (2, 2),
++                        mesh_groups: 0,
++                    },
++                )
++                .unwrap_or_else(|e| panic!("{label}: draw failed: {e}"));
++            assert_eq!(pixels, vec![want; 4], "{label}, selector {selector}");
++        }
++        ran += 1;
++    }
++    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
++}

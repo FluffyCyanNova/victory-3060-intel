@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 08:05:58 -0500
+Subject: [PATCH 40/43] Check declared guest ranges before skipping
+ write-combining readback
+
+(cherry picked from commit f9c43fabc20f2173f52028755c59286b14118dab)
+---
+ crates/victory-gpu/src/census.rs | 72 +++++++++++++++++++++++++-------
+ crates/victory-gpu/src/host.rs   |  6 +--
+ 2 files changed, 61 insertions(+), 17 deletions(-)
+
+diff --git a/crates/victory-gpu/src/census.rs b/crates/victory-gpu/src/census.rs
+index ef8e316ad..2ce646786 100644
+--- a/crates/victory-gpu/src/census.rs
++++ b/crates/victory-gpu/src/census.rs
+@@ -82,16 +82,21 @@ pub(crate) fn skip_wc_compare() -> bool {
+     })
+ }
+ 
+-/// Whether the title buffer at `start` lies in memory the title reserved
+-/// write-combining (needs the census or a skip switch on, which record the
+-/// reservations).
+-pub(crate) fn is_wc(start: u64) -> bool {
+-    RESERVATIONS
+-        .lock()
+-        .unwrap_or_else(|e| e.into_inner())
+-        .range(..=start as usize)
+-        .next_back()
+-        .is_some_and(|(base, r)| *base + r.len > start as usize && r.protect & 0x400 != 0)
++/// Every declared title range must lie wholly inside a single WC reservation.
++/// A card copy (especially an aligned loose window) can cover several.
++pub(crate) fn all_wc(ranges: &[(usize, usize)]) -> bool {
++    let reservations = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
++    all_wc_in(&reservations, ranges)
++}
++
++fn all_wc_in(reservations: &BTreeMap<usize, Reservation>, ranges: &[(usize, usize)]) -> bool {
++    !ranges.is_empty() && ranges.iter().all(|&(from, to)| {
++        // Seeking from the exclusive end also detects a new reservation
++        // beginning inside the range. An allocation ending at `to` fits.
++        from < to && reservations.range(..to).next_back().is_some_and(|(&base, r)| {
++            base <= from && r.protect & 0x400 != 0 && base.checked_add(r.len).is_some_and(|end| to <= end)
++        })
++    })
+ }
+ 
+ /// Declared ranges left out of the compare by [`skip_wc_compare`].
+@@ -101,13 +106,13 @@ pub(crate) static UNCOMPARED: std::sync::atomic::AtomicU64 = std::sync::atomic::
+ pub(crate) static SKIPPED: [std::sync::atomic::AtomicU64; 2] =
+     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+ 
+-/// With [`skip_wc_back`]: whether a piece of `bytes` of the copy of the
+-/// title buffer at `start` is left on the card (counted).
+-pub(crate) fn skip_back(start: u64, bytes: u64) -> bool {
++/// A flagged piece is clipped to its declaration. Keep every piece of a
++/// mixed declaration so the normal read-back covers it in full.
++pub(crate) fn skip_back(declared: (usize, usize), bytes: u64) -> bool {
+     if !skip_wc_back() {
+         return false;
+     }
+-    let wc = is_wc(start);
++    let wc = all_wc(&[declared]);
+     if wc {
+         use std::sync::atomic::Ordering;
+         let n = SKIPPED[0].fetch_add(1, Ordering::Relaxed) + 1;
+@@ -119,6 +124,45 @@ pub(crate) fn skip_back(start: u64, bytes: u64) -> bool {
+     wc
+ }
+ 
++#[cfg(test)]
++mod wc_tests {
++    use super::{Reservation, all_wc_in};
++    use std::collections::BTreeMap;
++
++    fn reservation(len: usize, protect: u32) -> Reservation {
++        Reservation { len, kind: 0, flags: 0, protect }
++    }
++
++    #[test]
++    fn a_write_in_the_ordinary_half_of_a_card_window_still_comes_back() {
++        const MIB: usize = 1 << 20;
++        let window = 8 * MIB;
++        let middle = window + 2 * MIB;
++        let map = BTreeMap::from([(window, reservation(2 * MIB, 0x404)), (middle, reservation(2 * MIB, 0x04))]);
++        let wc = (middle - 65536, middle);
++        let ordinary = (middle, middle + 65536);
++        assert!(all_wc_in(&map, &[wc]));
++        assert!(!all_wc_in(&map, &[ordinary]));
++        assert!(!all_wc_in(&map, &[wc, ordinary]));
++        assert!(!all_wc_in(&map, &[(wc.0, ordinary.1)]));
++    }
++
++    #[test]
++    fn a_declaration_must_fit_one_known_reservation() {
++        let map = BTreeMap::from([
++            (0x10000, reservation(0x10000, 0x404)),
++            (0x20000, reservation(0x10000, 0x404)),
++            (usize::MAX - 8, reservation(16, 0x404)),
++        ]);
++        assert!(all_wc_in(&map, &[(0x10000, 0x20000), (0x20000, 0x30000)]));
++        assert!(!all_wc_in(&map, &[(0x1ffff, 0x20001)]));
++        assert!(!all_wc_in(&map, &[(0x30000, 0x30001)]));
++        assert!(!all_wc_in(&map, &[(0x10000, 0x10000)]));
++        assert!(!all_wc_in(&map, &[(usize::MAX - 8, 1)]));
++        assert!(!all_wc_in(&map, &[(usize::MAX - 8, usize::MAX)]));
++    }
++}
++
+ /// Host resources made, by where: count and bytes ([`made`]).
+ const KINDS: [&str; 9] = ["read-back", "upload", "shared", "uav", "texture", "reserved texture", "depth twin", "placed in title memory", "host list"];
+ static MADE: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 1aadbcf34..e4f3a21a1 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -3454,7 +3454,7 @@ impl Host {
+         // flights' own declared writes (`declared_writes`).
+         if crate::census::skip_wc_compare() {
+             let before = declared.len();
+-            declared.retain(|(shadow, _)| !crate::census::is_wc(shadow.title_start()));
++            declared.retain(|(_, ranges)| !crate::census::all_wc(ranges));
+             crate::census::UNCOMPARED.fetch_add((before - declared.len()) as u64, Ordering::Relaxed);
+         }
+         // With the relay: the order of the queue is held from here until
+@@ -3789,7 +3789,7 @@ impl Host {
+                         }
+                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                         if lo < hi
+-                            && !crate::census::skip_back(r.shadow.title_start(), (hi - lo) as u64)
++                            && !crate::census::skip_back(r.declared, (hi - lo) as u64)
+                             && seen.insert((copy, lo, hi))
+                         {
+                             pieces.push((r.shadow.clone(), lo, hi, total));
+@@ -4212,7 +4212,7 @@ impl Host {
+                 }
+                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                 if lo < hi
+-                    && !crate::census::skip_back(r.shadow.title_start(), (hi - lo) as u64)
++                    && !crate::census::skip_back(r.declared, (hi - lo) as u64)
+                     && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
+                 {
+                     pieces.push((i, lo, hi, total));

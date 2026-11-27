@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Sat, 28 Nov 2026 01:17:43 +0800
+Subject: [PATCH] Capture: a frame's operations file is not emptied by a late
+ line
+
+The operations of a listed frame go to frame-<n>-ops.txt. One file was
+open at a time and made anew whenever a line's frame differed from the
+open one. The title records on several threads, so a line of the frame
+before can come in after the next frame's first line: it made the
+earlier frame's file anew, which emptied it, and the next line did the
+same to the newer one. With single listed frames nothing follows to do
+that; with three in a row (VICTORY_CAPTURE_TRIGGER) each file kept only
+what came after its last late line: run 67's three files held 52 to 75
+lines and 0 to 4 draws for frames of about 1,400 draws.
+
+The files of the four newest frames now stay open, each with its own
+line count; a line of a frame older than those is dropped.
+
+Test: a_late_line_of_the_frame_before_does_not_empty_its_file.
+victory-gpu with diagnostics: 164 passed, 0 failed.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+(cherry picked from commit 44049de2e6edfe675e1a8b69e96ce5d9f6a18bb0)
+---
+ crates/victory-gpu/src/capture.rs | 82 +++++++++++++++++++++++++++----
+ 1 file changed, 72 insertions(+), 10 deletions(-)
+
+diff --git a/crates/victory-gpu/src/capture.rs b/crates/victory-gpu/src/capture.rs
+index 856b664ed..6aafeba47 100644
+--- a/crates/victory-gpu/src/capture.rs
++++ b/crates/victory-gpu/src/capture.rs
+@@ -150,21 +150,48 @@ pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
+     let Some(folder) = folder() else {
+         return;
+     };
+-    static FILE: std::sync::Mutex<Option<(u64, u64, std::fs::File)>> = std::sync::Mutex::new(None);
++    // The files of the last few frames stay open ([`frame_file`]): the
++    // title records on several threads, and a line of the frame before
++    // comes in after the next frame's first one. With one file open at a
++    // time, made anew at each change of frame, such a line emptied the
++    // file of the frame it belongs to (seen with three listed frames in a
++    // row: each file kept only what came after its last late line).
++    static FILES: std::sync::Mutex<Vec<(u64, u64, std::fs::File)>> = std::sync::Mutex::new(Vec::new());
+     let what = what();
+-    let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
+-    if file.as_ref().is_none_or(|f| f.0 != frame) {
+-        let Ok(made) = std::fs::File::create(folder.join(format!("frame-{frame}-ops.txt"))) else {
+-            return;
+-        };
+-        *file = Some((frame, 0, made));
+-    }
+-    if let Some((_, n, f)) = file.as_mut() {
+-        *n += 1;
++    let mut files = FILES.lock().unwrap_or_else(|e| e.into_inner());
++    let made = || std::fs::File::create(folder.join(format!("frame-{frame}-ops.txt"))).ok();
++    if let Some((n, f)) = frame_file(&mut files, frame, made) {
+         let _ = writeln!(f, "{n} list {list:#x} {what}");
+     }
+ }
+ 
++/// The open file of `frame` among `files` (frame, lines so far, file) and
++/// the number of the line about to be written; made with `make` the first
++/// time the frame is seen, and kept while the frame is one of the four
++/// newest. A frame older than those four gets no file again (it would be
++/// made anew, empty).
++#[cfg(feature = "diagnostics")]
++fn frame_file<T>(files: &mut Vec<(u64, u64, T)>, frame: u64, make: impl FnOnce() -> Option<T>) -> Option<(u64, &mut T)> {
++    const KEPT: usize = 4;
++    let at = match files.iter().position(|f| f.0 == frame) {
++        Some(at) => at,
++        None => {
++            if files.len() >= KEPT {
++                let oldest = files.iter().enumerate().min_by_key(|(_, f)| f.0).map(|(i, f)| (i, f.0))?;
++                if frame < oldest.1 {
++                    return None;
++                }
++                files.swap_remove(oldest.0);
++            }
++            files.push((frame, 0, make()?));
++            files.len() - 1
++        }
++    };
++    let (_, n, file) = &mut files[at];
++    *n += 1;
++    Some((*n, file))
++}
++
+ /// The last lines of [`op`] before the world.
+ #[cfg(feature = "diagnostics")]
+ static RING: std::sync::Mutex<std::collections::VecDeque<String>> =
+@@ -983,6 +1010,41 @@ pub(crate) fn recent_levels() -> Vec<u8> {
+ 
+ #[cfg(test)]
+ mod tests {
++    /// A line of the frame before, coming in after the next frame's first
++    /// line, goes to its own frame's file, which keeps what it held.
++    #[cfg(feature = "diagnostics")]
++    #[test]
++    fn a_late_line_of_the_frame_before_does_not_empty_its_file() {
++        let mut files: Vec<(u64, u64, Vec<u64>)> = Vec::new();
++        let mut made = 0;
++        let mut write = |files: &mut Vec<(u64, u64, Vec<u64>)>, frame: u64| {
++            let line = super::frame_file(files, frame, || {
++                made += 1;
++                Some(Vec::new())
++            });
++            line.map(|(n, file)| {
++                file.push(n);
++                n
++            })
++        };
++        assert_eq!(write(&mut files, 10), Some(1));
++        assert_eq!(write(&mut files, 10), Some(2));
++        assert_eq!(write(&mut files, 11), Some(1));
++        // The late line: third of frame 10, whose first two are still there.
++        assert_eq!(write(&mut files, 10), Some(3));
++        assert_eq!(write(&mut files, 11), Some(2));
++        assert_eq!(files.iter().find(|f| f.0 == 10).map(|f| f.2.clone()), Some(vec![1, 2, 3]));
++        // Four frames are kept; a fifth lets the oldest go, and a line of
++        // a frame older than those kept is dropped, not written to a new
++        // file.
++        for frame in [12, 13, 14] {
++            assert_eq!(write(&mut files, frame), Some(1));
++        }
++        assert!(files.iter().all(|f| f.0 != 10));
++        assert_eq!(write(&mut files, 10), None);
++        assert_eq!(made, 5);
++    }
++
+     /// A trigger lists the three frames from the one it names.
+     #[test]
+     fn a_trigger_lists_its_three_frames_and_no_others() {
+-- 
+2.56.0.windows.3
+

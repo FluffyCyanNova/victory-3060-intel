@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 15:10:28 +0800
+Subject: [PATCH 26/43] Local (fork-ports2): fork PR #749's view table instead
+ of #738's; #738's wave part kept
+
+#738 and #749 both put a table of buffer-view addresses by heap slot on root SRV
+252. #749's is kept (16-byte records: address, length, stride; written with the
+strides); #738's table, its host code and its view_address change are reverted.
+From #738 stay: a mask holding lanes outside EXEC is the lanes' ballot also for
+the console's own waves, and that failure retries with the skip widened; a heap
+slot the code names outright asks the table too. view_address_indexed lives in
+lower_local.rs (lower.rs stays under the asset policy's 512 KiB). Unbuilt.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-shader/src/emit/lower.rs       | 87 ++++---------------
+ crates/victory-shader/src/emit/lower_local.rs | 57 ++++++++++++
+ crates/victory-shader/src/emit/mod.rs         |  7 +-
+ 3 files changed, 80 insertions(+), 71 deletions(-)
+
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 5c1e29aaa..e855d4070 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -2776,60 +2776,6 @@ impl<'a> Lower<'a> {
+         Some((lo, hi))
+     }
+ 
+-    /// [`view_address`] for a table entry chosen at run time (a computed
+-    /// index into a descriptor table or the resource heap): the host's table
+-    /// of the buffer views' title addresses by heap slot
+-    /// ([`shader::SLOT_VIEWS`]).
+-    fn view_address_indexed(&mut self, site: Site, first: u8) -> Result<Option<(V, V, V, V)>, Why> {
+-        let a = *self
+-            .scalar
+-            .get(&site)
+-            .ok_or("an untracked descriptor load")?;
+-        let root = self
+-            .x
+-            .native
+-            .layout
+-            .get(a.param)
+-            .map(|p| p.root)
+-            .ok_or("a descriptor outside the tables")?;
+-        if !matches!(root, RootType::Table | RootType::ResourceHeap) || a.dynamic.is_none() {
+-            return Ok(None);
+-        }
+-        let c = self.cur;
+-        let slot = self.heap_index(site, first, false)?;
+-        let last = self.s.m.i32(super::shader::SLOT_VIEWS_COUNT - 1);
+-        let i32t = self.s.t.i32;
+-        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+-        self.s.m.tag(slot, Tag::Clamp);
+-        let shift = self.s.m.i32(view_record_shift());
+-        let byte = self.s.m.bin(c, Bin::Shl, slot, shift);
+-        let h = self.s.root_srv_handle(super::shader::SLOT_VIEWS);
+-        let iu = self.s.m.undef(self.s.t.i32);
+-        let mask = self.s.m.i8(0xF);
+-        let align = self.s.m.i32(4);
+-        let r = self.s.op(
+-            c,
+-            "rawBufferLoad.f32",
+-            Attr::ReadOnly,
+-            self.s.t.res_ret,
+-            139,
+-            &[h, byte, iu, mask, align],
+-        );
+-        let lo = self.s.m.extract(c, r, 0);
+-        let hi = self.s.m.extract(c, r, 1);
+-        let len = self.s.m.extract(c, r, 2);
+-        let stride = self.s.m.extract(c, r, 3);
+-        let (lo, hi, len, stride) = (
+-            self.as_int(lo),
+-            self.as_int(hi),
+-            self.as_int(len),
+-            self.as_int(stride),
+-        );
+-        // The loaded address is the view's own: `a.offset` is a place in the
+-        // descriptor table (already part of `slot`), not in the buffer.
+-        Ok(Some((lo, hi, len, stride)))
+-    }
+-
+     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
+     fn address_plus(&mut self, lo: V, hi: V, off: i32) -> (V, V) {
+         if off == 0 {
+@@ -3176,15 +3122,23 @@ impl<'a> Lower<'a> {
+         };
+         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+         // A mask that holds lanes outside EXEC where it is written (the complement of one,
+-        // say) is the ballot of the lanes that are there: all of them, where two exchanging
+-        // host waves know every lane runs that block.
+-        let made = self.def_block.get(&lo).copied();
+-        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+-        if !self.x.st.active.contains(&lo) && !whole {
+-            if self.exchange.is_some() && !self.local {
+-                need(made.unwrap_or(0));
++        // say) is the ballot of the lanes that are there: all of them, where every lane of
++        // the wave runs that block (fork PR #738: also for the console's own waves).
++        if !self.x.st.active.contains(&lo) {
++            let made = self.def_block.get(&lo).copied();
++            let whole = self.mask_data == MaskData::Console
++                && !self.local
++                && made.is_none_or(|b| match &self.exchange {
++                    Some((_, _, all)) => all.get(b).copied().unwrap_or(false),
++                    None => all_lane_blocks(self.x.st)
++                        .is_some_and(|all| all.get(b).copied().unwrap_or(false)),
++                });
++            if !whole {
++                if self.mask_data == MaskData::Console && !self.local {
++                    need(made.unwrap_or(0));
++                }
++                return Err(MASK_ELSEWHERE);
+             }
+-            return Err(MASK_ELSEWHERE);
+         }
+         let (x, y) = match self.ballots.get(&lo) {
+             Some(&xy) => xy,
+@@ -11508,12 +11462,9 @@ mod tests {
+     fn view_address_indexed_keeps_the_loaded_address() {
+         // The table offset is part of the slot, not of the buffer address:
+         // the function must not add `a.offset` to what the table holds.
+-        let src = include_str!("lower.rs");
+-        let body = src
+-            .split("fn view_address_indexed")
+-            .nth(1)
+-            .and_then(|s| s.split("fn address_plus").next())
+-            .unwrap();
++        // (local: the function lives in lower_local.rs, the last one there)
++        let src = include_str!("lower_local.rs");
++        let body = src.split("fn view_address_indexed").nth(1).unwrap();
+         assert!(!body.contains("address_plus("));
+     }
+ 
+diff --git a/crates/victory-shader/src/emit/lower_local.rs b/crates/victory-shader/src/emit/lower_local.rs
+index 1a24d1ff4..ba23679ba 100644
+--- a/crates/victory-shader/src/emit/lower_local.rs
++++ b/crates/victory-shader/src/emit/lower_local.rs
+@@ -46,4 +46,61 @@ impl Lower<'_> {
+         offset.is_some_and(|o| o % 32 == 0)
+             && (2..count.min(4)).any(|k| inst.write(Reg::S(code + k as u8)).is_some_and(read))
+     }
++
++    /// [`view_address`] for a table entry chosen at run time (a computed
++    /// index into a descriptor table or the resource heap): the host's table
++    /// of the buffer views' title addresses by heap slot
++    /// ([`shader::SLOT_VIEWS`]).
++    pub(super) fn view_address_indexed(&mut self, site: Site, first: u8) -> Result<Option<(V, V, V, V)>, Why> {
++        let a = *self
++            .scalar
++            .get(&site)
++            .ok_or("an untracked descriptor load")?;
++        let root = self
++            .x
++            .native
++            .layout
++            .get(a.param)
++            .map(|p| p.root)
++            .ok_or("a descriptor outside the tables")?;
++        // (local, from fork PR #738: a heap slot the code names outright asks
++        // the table too; a table entry at a fixed place has its root view)
++        let fixed = a.dynamic.is_none();
++        if !matches!((root, fixed), (RootType::Table, false) | (RootType::ResourceHeap, _)) {
++            return Ok(None);
++        }
++        let c = self.cur;
++        let slot = self.heap_index(site, first, false)?;
++        let last = self.s.m.i32(crate::emit::shader::SLOT_VIEWS_COUNT - 1);
++        let i32t = self.s.t.i32;
++        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
++        self.s.m.tag(slot, Tag::Clamp);
++        let shift = self.s.m.i32(view_record_shift());
++        let byte = self.s.m.bin(c, Bin::Shl, slot, shift);
++        let h = self.s.root_srv_handle(crate::emit::shader::SLOT_VIEWS);
++        let iu = self.s.m.undef(self.s.t.i32);
++        let mask = self.s.m.i8(0xF);
++        let align = self.s.m.i32(4);
++        let r = self.s.op(
++            c,
++            "rawBufferLoad.f32",
++            Attr::ReadOnly,
++            self.s.t.res_ret,
++            139,
++            &[h, byte, iu, mask, align],
++        );
++        let lo = self.s.m.extract(c, r, 0);
++        let hi = self.s.m.extract(c, r, 1);
++        let len = self.s.m.extract(c, r, 2);
++        let stride = self.s.m.extract(c, r, 3);
++        let (lo, hi, len, stride) = (
++            self.as_int(lo),
++            self.as_int(hi),
++            self.as_int(len),
++            self.as_int(stride),
++        );
++        // The loaded address is the view's own: `a.offset` is a place in the
++        // descriptor table (already part of `slot`), not in the buffer.
++        Ok(Some((lo, hi, len, stride)))
++    }
+ }
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index a62686dff..d31466167 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -539,12 +539,13 @@ pub fn emit(
+         }
+     }
+     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
+-    // trace programs): right once the wave takes that skip together ([`widen`]; the
+-    // lowering has named the skipped blocks).
++    // trace programs), or a mask holding lanes outside EXEC written behind a per-lane skip:
++    // right once the wave takes that skip together ([`widen`]; the lowering has named the
++    // skipped blocks).
+     let original = match original {
+         Err(ShaderError::Unsupported { what, .. })
+             if native.stage == HwStage::Cs
+-                && what == lower::LANE_MASK
++                && (what == lower::LANE_MASK || what == lower::MASK_ELSEWHERE)
+                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
+         {
+             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());

@@ -1,0 +1,299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Fri, 27 Nov 2026 23:40:38 +0800
+Subject: [PATCH 2/2] VICTORY_SHADER_HASHES=<file>: which shaders reach us, and
+ by which way
+
+Off when unset. Diagnostics only: device methods 0x1c8 and 0x218 still
+fail as they did. The file gets one line for
+- each new container the title hands a pipeline creation: the name we
+  give it, its stage, its shader hash (the XDAT index entry of kind
+  0x10, "-" without one) and each native program in it: stage, code
+  length, the code's first 32 bytes, 16 hex digits of the code's BLAKE3;
+- each call of 0x1c8 and 0x218 (all of them): the method, the call's
+  number, length and hash of its small pieces (state block and input
+  layout for 0x1c8; the two small pieces and the hash-like word for
+  0x218) and for each stage the same three things about its code and
+  the last entry of its record (tag 0x43 and the shader's 16-byte hash).
+
+Why: those two methods are handed code and records, not containers
+(what VICTORY_PIPELINE_X_DUMP showed). Joined on the code's hash or its
+first bytes (the compiler's prologue carries the shader hash), the file
+says whether these shaders also come as containers, whose stage data we
+can read, and how many shaders and states the calls are.
+
+Tests: xdat_blob (2), code_words, record_tail. victory-gpu: 160 passed,
+0 failed.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/device.rs   |  74 +++++++++++++++
+ crates/victory-gpu/src/pipeline.rs | 139 +++++++++++++++++++++++++++++
+ 2 files changed, 213 insertions(+)
+
+diff --git a/crates/victory-gpu/src/device.rs b/crates/victory-gpu/src/device.rs
+index d6a4cc0af..2cb7835e9 100644
+--- a/crates/victory-gpu/src/device.rs
++++ b/crates/victory-gpu/src/device.rs
+@@ -425,6 +425,65 @@ fn pipeline_x_dump(slot: usize, call: u32, desc: *const u8) {
+     let _ = std::fs::write(dir.join(format!("x{slot:x}-{call}.txt")), text);
+ }
+ 
++/// The last entry of a stage's record in a description of device method
++/// 0x1c8 or 0x218: its tag and the 16 bytes behind it. The records end
++/// with an entry of 32 bytes tagged 0x43 that holds the shader's hash.
++fn record_tail(record: &[u8]) -> Option<(u32, [u8; 16])> {
++    let at = record.len().checked_sub(32)?;
++    let tag = u32::from_le_bytes(record[at..at + 4].try_into().ok()?);
++    Some((tag, record[at + 4..at + 20].try_into().ok()?))
++}
++
++/// A call of device method 0x1c8 or 0x218 for
++/// `VICTORY_SHADER_HASHES` (`pipeline::hash_line`): the method, the call's
++/// number, what its small pieces are (the state block's and the input
++/// layout's hash for 0x1c8; the two small pieces' and the hash-like word
++/// for 0x218) and, for each stage it names, the code
++/// (`pipeline::code_words`) and its record's last entry ([`record_tail`]).
++/// What cannot be read is said so.
++#[cfg(windows)]
++fn pipeline_x_hashes(slot: usize, call: u32, desc: *const u8) -> String {
++    use crate::pipeline::{code_words, hex};
++    let mut line = format!("x{slot:x} call={call}");
++    let mut bytes = [0u8; 128];
++    if desc.is_null() || !crate::host::read_into(desc, &mut bytes) {
++        return line + " description not readable";
++    }
++    let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
++    // A piece named by words `i` (address) and `i + 1` (length).
++    let piece = |i: usize| -> Option<Vec<u8>> {
++        let (at, len) = (words[i], words[i + 1] as usize);
++        if at == 0 || len == 0 || len > 0x10_0000 {
++            return None;
++        }
++        let mut piece = vec![0u8; len];
++        crate::host::read_into(at as *const u8, &mut piece).then_some(piece)
++    };
++    let sum = |i: usize| piece(i).map_or_else(|| "-".to_owned(), |p| format!("{}:{}", p.len(), &blake3::hash(&p).to_hex()[..16]));
++    let stages: &[(usize, usize)] = if slot == 0x218 {
++        line.push_str(&format!(" state={} small={} word={:016x}", sum(1), sum(3), words[11]));
++        &[(5, 7)]
++    } else {
++        line.push_str(&format!(" state={} layout={}", sum(1), sum(3)));
++        &[(5, 7), (9, 11)]
++    };
++    for &(code, record) in stages {
++        match (piece(code), piece(record)) {
++            (None, None) => line.push_str(" | none"),
++            (code, record) => {
++                line.push_str(" | ");
++                line.push_str(&code.map_or_else(|| "code not readable".to_owned(), |c| code_words(&c)));
++                match record.as_deref().map(|r| (r.len(), record_tail(r))) {
++                    Some((len, Some((tag, hash)))) => line.push_str(&format!(" record={len} tag={tag:#x} hash={}", hex(&hash))),
++                    Some((len, None)) => line.push_str(&format!(" record={len} short")),
++                    None => line.push_str(" record not readable"),
++                }
++            }
++        }
++    }
++    line
++}
++
+ /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
+ /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
+ /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
+@@ -450,6 +509,8 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
+     }
+     #[cfg(windows)]
+     pipeline_x_dump(SLOT, calls, desc);
++    #[cfg(windows)]
++    crate::pipeline::hash_line(|| pipeline_x_hashes(SLOT, calls, desc));
+     if calls <= 4 || calls.is_power_of_two() {
+         // Sixteen 64-bit words at `at`, read through the kernel: neither
+         // pointer is known to be mapped.
+@@ -545,6 +606,19 @@ mod tests {
+     use super::*;
+     use crate::object::slot;
+ 
++    /// A stage record ends with its hash entry: 32 bytes, the tag 0x43,
++    /// then the 16 bytes of the hash.
++    #[test]
++    fn a_records_last_entry_is_its_tag_and_the_sixteen_bytes_behind_it() {
++        let mut record = vec![0xEEu8; 16 + 32];
++        record[16..20].copy_from_slice(&0x43u32.to_le_bytes());
++        let hash: [u8; 16] = std::array::from_fn(|i| i as u8 + 1);
++        record[20..36].copy_from_slice(&hash);
++        assert_eq!(record_tail(&record), Some((0x43, hash)));
++        assert_eq!(record_tail(&record[16..]), Some((0x43, hash)));
++        assert_eq!(record_tail(&record[..31]), None);
++    }
++
+     /// The first call of method 0x1c8 a run logged: six pieces, each an
+     /// address and a length.
+     #[test]
+diff --git a/crates/victory-gpu/src/pipeline.rs b/crates/victory-gpu/src/pipeline.rs
+index 62e138dff..6a096ff0c 100644
+--- a/crates/victory-gpu/src/pipeline.rs
++++ b/crates/victory-gpu/src/pipeline.rs
+@@ -101,6 +101,98 @@ pub(crate) fn kept() -> [u64; 7] {
+     ]
+ }
+ 
++/// `VICTORY_SHADER_HASHES=<file>`: `line()` appended to it, a line of its
++/// own (off when unset, and `line` is not called). The file says which
++/// shaders reach us and how: one line for each container the title hands
++/// a pipeline creation ([`container_line`]) and one for each call of
++/// device methods 0x1c8 and 0x218, which hand over code and records
++/// instead (`device::pipeline_x_hashes`). Joined on the code's hash, the
++/// two tell whether the shaders of those two methods come as containers
++/// too, and how many there are.
++pub(crate) fn hash_line(line: impl FnOnce() -> String) {
++    use std::io::Write;
++    static OUT: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
++    let Some(out) = OUT.get_or_init(|| {
++        let path = std::env::var_os("VICTORY_SHADER_HASHES")?;
++        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
++            Ok(file) => {
++                tracing::info!(file = %std::path::Path::new(&path).display(), "shader hashes are listed (VICTORY_SHADER_HASHES)");
++                Some(Mutex::new(file))
++            }
++            Err(e) => {
++                tracing::warn!(error = %e, "VICTORY_SHADER_HASHES: the file cannot be opened");
++                None
++            }
++        }
++    }) else {
++        return;
++    };
++    let mut text = line();
++    text.push('\n');
++    let _ = out.lock().unwrap_or_else(|e| e.into_inner()).write_all(text.as_bytes());
++}
++
++/// `bytes` as lowercase hex.
++pub(crate) fn hex(bytes: &[u8]) -> String {
++    bytes.iter().map(|b| format!("{b:02x}")).collect()
++}
++
++/// A program's native code for [`hash_line`]: its length, its first 32
++/// bytes (the prologue the console compiler writes the shader's hash
++/// into) and the first 16 hex digits of the code's BLAKE3 hash.
++pub(crate) fn code_words(code: &[u8]) -> String {
++    format!(
++        "len={} head={} code={}",
++        code.len(),
++        hex(&code[..code.len().min(32)]),
++        &blake3::hash(code).to_hex()[..16]
++    )
++}
++
++/// The first blob of `kind` in the `XDAT` index of a `DXIL` part's data
++/// (`victory_shader::native`: the index sits at +0x18, a count at +0x1c,
++/// then 12 bytes an entry: kind, offset and size, the offset from the
++/// start of the part's data). Kind 0x10 is the shader's 16-byte hash.
++pub(crate) fn xdat_blob(part: &[u8], kind: u32) -> Option<&[u8]> {
++    let word = |at: usize| Some(u32::from_le_bytes(part.get(at..at + 4)?.try_into().ok()?));
++    if part.get(0x18..0x1c)? != b"XDAT" {
++        return None;
++    }
++    let count = word(0x1c)?.min(64) as usize;
++    (0..count).find_map(|i| {
++        let at = 0x24 + 12 * i;
++        if word(at)? != kind {
++            return None;
++        }
++        let (offset, size) = (word(at + 4)? as usize, word(at + 8)? as usize);
++        part.get(offset..offset.checked_add(size)?)
++    })
++}
++
++/// A container's line for [`hash_line`]: the name we give it, its stage,
++/// its shader hash (`xdat10`) and each native program in it
++/// ([`code_words`]).
++fn container_line(stage: &str, name: &str, bytes: &[u8]) -> String {
++    use victory_shader::{Container, FourCC};
++    let mut line = format!("container {name} {stage}");
++    let Ok(container) = Container::parse(bytes) else {
++        return line + " unparsed";
++    };
++    let Some(part) = container.part(FourCC::DXIL) else {
++        return line + " no-dxil-part";
++    };
++    line.push_str(&format!(" xdat10={}", xdat_blob(part.data, 0x10).map_or_else(|| "-".to_owned(), hex)));
++    match victory_shader::native_programs(part.data) {
++        Ok(programs) => {
++            for p in &programs {
++                line.push_str(&format!(" | {:?} {}", p.stage, code_words(&p.code)));
++            }
++        }
++        Err(e) => line.push_str(&format!(" | native programs: {e}")),
++    }
++    line
++}
++
+ /// The shared container for `bytes`.
+ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+     let full = blake3::hash(bytes);
+@@ -109,6 +201,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+         .get_or_insert_with(HashMap::new)
+         .entry(*full.as_bytes())
+         .or_insert_with(|| {
++            hash_line(|| container_line(stage, &full.to_hex()[..16], bytes));
+             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+             Arc::new(Shader {
+@@ -730,6 +823,52 @@ pub fn save_pipeline_cache() {
+ 
+ #[cfg(test)]
+ mod tests {
++    /// A part's data with an `XDAT` index of these blobs behind it.
++    fn xdat_part(blobs: &[(u32, &[u8])]) -> Vec<u8> {
++        let mut part = vec![0u8; 0x18];
++        part.extend_from_slice(b"XDAT");
++        part.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
++        part.extend_from_slice(&0x24u32.to_le_bytes());
++        let mut at = part.len() + 12 * blobs.len();
++        for (kind, blob) in blobs {
++            for word in [*kind, at as u32, blob.len() as u32] {
++                part.extend_from_slice(&word.to_le_bytes());
++            }
++            at += blob.len();
++        }
++        for (_, blob) in blobs {
++            part.extend_from_slice(blob);
++        }
++        part
++    }
++
++    #[test]
++    fn the_shader_hash_is_the_index_entry_of_kind_0x10() {
++        let hash: [u8; 16] = std::array::from_fn(|i| 0xA0 + i as u8);
++        let part = xdat_part(&[(0x0a, b"xbop"), (0x10, &hash), (0x12, &[7; 16])]);
++        assert_eq!(super::xdat_blob(&part, 0x10), Some(&hash[..]));
++        assert_eq!(super::xdat_blob(&part, 0x0a), Some(&b"xbop"[..]));
++        assert_eq!(super::xdat_blob(&part, 0x0d), None);
++    }
++
++    #[test]
++    fn a_part_without_an_index_or_with_an_entry_past_its_end_has_no_hash() {
++        assert_eq!(super::xdat_blob(&[0u8; 64], 0x10), None);
++        assert_eq!(super::xdat_blob(b"short", 0x10), None);
++        let mut part = xdat_part(&[(0x10, &[1; 16])]);
++        part.truncate(part.len() - 1);
++        assert_eq!(super::xdat_blob(&part, 0x10), None);
++    }
++
++    #[test]
++    fn code_is_listed_by_length_first_bytes_and_hash() {
++        let code: Vec<u8> = (0..40u8).collect();
++        let words = super::code_words(&code);
++        assert!(words.starts_with("len=40 head=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f code="), "{words}");
++        assert_eq!(words.len(), "len=40 head= code=".len() + 64 + 16);
++        assert!(super::code_words(&[1, 2]).starts_with("len=2 head=0102 code="));
++    }
++
+     #[cfg(all(windows, feature = "diagnostics"))]
+     #[test]
+     fn skip_hashes_accepts_full_hashes_only() {
+-- 
+2.56.0.windows.3
+

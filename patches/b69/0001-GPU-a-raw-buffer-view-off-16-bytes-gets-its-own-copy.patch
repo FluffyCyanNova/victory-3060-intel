@@ -1,0 +1,494 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Sat, 28 Nov 2026 02:34:10 +0800
+Subject: [PATCH] GPU: a raw buffer view off 16 bytes gets its own copy
+ (VICTORY_RAW_OWN_COPY=1); refused views are named
+
+The host takes a raw buffer view on 16 bytes only (upstream #3540: another
+one removes the device); the console takes any dword. Such a view was
+refused and its slot read zeros: "buffer view the host would refuse left
+null ... first=2 count=72 ... raw=true" and an unordered one of 1984 dwords
+in the runs of 2026-11-27/28 (158 and 199 views left null).
+
+With VICTORY_RAW_OWN_COPY=1 (off by default) a raw view that is on a dword
+of its buffer's host copy but not on 16 bytes of it is made on a copy of
+its own bytes, from byte 0: the path views off their copy's elements
+already take (own_bytes, shadow::exact). Shader and unordered views, and
+the copy a list brings up to date (buffer_copy), ask the same question.
+
+Always: the first 8 refused views of each of six kinds are logged with
+their heap slot, the title memory they read and the fields the host would
+get, and a line with the frame line counts them by kind, with the
+structured views that could not be made raw views (not on 16 bytes).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/descriptor/host.rs | 289 ++++++++++++++++++++--
+ crates/victory-gpu/src/host.rs            |   1 +
+ 2 files changed, 267 insertions(+), 23 deletions(-)
+
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 6ddb31577..8fe0f128e 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -763,6 +763,97 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
+ /// ([`buffer_view_ok`]), since the start.
+ pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ 
++/// Why the host would refuse a buffer view ([`buffer_view_refusal`] gives
++/// the index).
++const REFUSALS: [&str; 6] = [
++    "a raw view not on 16 bytes of its host copy",
++    "a raw view without the raw format, or with a stride",
++    "a structured view with a format, or with a stride the host has no buffers for",
++    "a typed view in a format without a size",
++    "a view of no elements",
++    "a view past its buffer's end",
++];
++
++/// [`REFUSED_VIEWS`] by kind ([`REFUSALS`]), since the start.
++static REFUSED_KINDS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
++
++/// Structured buffer views made as structured views since the start: their
++/// bytes do not start on 16 of the host copy, so they cannot be raw views
++/// of the same bytes ([`raw_window`]). Shaders read them as raw bytes, and
++/// such a read through a structured view gave zeros on NVIDIA; nothing
++/// else counts them.
++static STRUCTURED_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++thread_local! {
++    /// The heap slot whose view this thread makes ([`make`]), for the log
++    /// of refused views; `u32::MAX` before the first.
++    static MAKING: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
++}
++
++/// Counts a buffer view the host would refuse, by its kind, and names the
++/// first few of each kind: the heap slot, the title memory the view reads
++/// (`title`: address and bytes) and the fields the host would get. The
++/// lines that were there before name the first refused view only, and the
++/// frame line's count is of all kinds together (run 66: 158 views, one of
++/// them known).
++#[allow(clippy::too_many_arguments)]
++fn note_refused(
++    kind: usize,
++    unordered: bool,
++    title: (u64, u64),
++    format: DXGI_FORMAT,
++    first: u64,
++    count: u32,
++    stride: u32,
++    width: u64,
++) {
++    use std::sync::atomic::Ordering::Relaxed;
++    /// Lines per kind.
++    const NAMED: u64 = 8;
++    REFUSED_VIEWS.fetch_add(1, Relaxed);
++    let (Some(counter), Some(why)) = (REFUSED_KINDS.get(kind), REFUSALS.get(kind)) else {
++        return;
++    };
++    if counter.fetch_add(1, Relaxed) < NAMED {
++        tracing::warn!(
++            slot = MAKING.get(),
++            address = format_args!("{:#x}", title.0),
++            bytes = title.1,
++            format = format.0,
++            first,
++            count,
++            stride,
++            width,
++            unordered,
++            "buffer view left null: {why}"
++        );
++    }
++}
++
++/// With the frame line, when the numbers grew: the buffer views left null
++/// so far by kind, and the structured views left structured.
++pub(crate) fn refused_line() {
++    use std::sync::atomic::Ordering::Relaxed;
++    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++    let left = STRUCTURED_LEFT.load(Relaxed);
++    let total = REFUSED_VIEWS.load(Relaxed) + left;
++    if LAST.swap(total, Relaxed) == total {
++        return;
++    }
++    let kinds: Vec<String> = REFUSALS
++        .iter()
++        .zip(&REFUSED_KINDS)
++        .filter_map(|(why, n)| {
++            let n = n.load(Relaxed);
++            (n > 0).then(|| format!("{n}x {why}"))
++        })
++        .collect();
++    tracing::info!(
++        "buffer views left null so far, by kind: {}; structured views not on 16 bytes of their host copy, made as structured views so far (a raw read through one may give zeros): {left}",
++        if kinds.is_empty() { "none".to_owned() } else { kinds.join("; ") }
++    );
++}
++
+ /// Whether the host device is gone, and why (the first time it is asked
+ /// after that): for passes that make many views, to name the one that did
+ /// it.
+@@ -1467,6 +1558,7 @@ impl HostHeap {
+             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+                 continue;
+             };
++            MAKING.set(slot);
+             if let Some(kept) = make(&view, self.cpu(slot)) {
+                 self.keep(slot, kept);
+                 remade += 1;
+@@ -1726,6 +1818,7 @@ impl HostHeap {
+     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
+     /// host cannot.
+     pub(crate) fn make_at(&self, index: u32, view: &View) {
++        MAKING.set(index);
+         let kept = make(view, self.cpu(index));
+         if kept.is_none() {
+             null_for(view, self.cpu(index));
+@@ -2011,6 +2104,7 @@ impl HostHeap {
+             let kept = if later {
+                 None
+             } else {
++                MAKING.set(index);
+                 make(&view, self.cpu(index))
+             };
+             if kept.is_none() && !self.sampler {
+@@ -2224,9 +2318,9 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
+     // of the copy they find, so that the copy brought up to date is the
+     // one the slot shows.
+     if let Some((base, width)) = buffer_extent(view)
+-        && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
++        && let Some((first, count, element, stride, unknown, raw)) = buffer_fields(view)
+         && let Some(whole) = crate::shadow::find(base, width)
+-        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
++        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown, raw)
+         && let Some(own) = crate::shadow::exact(start, bytes)
+     {
+         return Some((own, start, bytes));
+@@ -2313,8 +2407,59 @@ fn own_copy_on() -> bool {
+ /// a view has no host view there; it is made on a copy of its own bytes
+ /// (`crate::shadow::exact`), where it starts at element 0. `None`: the
+ /// view is made on its buffer's copy, as every other.
+-fn own_bytes(offset: u64, base: u64, first: u64, count: u32, element: u64, stride: u32, unknown: bool) -> Option<(u64, u64)> {
++///
++/// `raw`: the view is a raw one ([`raw_view`]), which the host takes on 16
++/// bytes only: [`raw_own_bytes_if`].
++#[allow(clippy::too_many_arguments)]
++fn own_bytes(
++    offset: u64,
++    base: u64,
++    first: u64,
++    count: u32,
++    element: u64,
++    stride: u32,
++    unknown: bool,
++    raw: bool,
++) -> Option<(u64, u64)> {
+     own_bytes_if(own_copy_on(), offset, base, first, count, element, stride, unknown)
++        .or_else(|| raw_own_bytes_if(raw && own_copy_on() && raw_own_copy(), offset, base, first, count))
++}
++
++/// Whether a raw buffer view that is on a dword of its buffer's host copy
++/// but not on 16 bytes of it gets a copy of its own bytes
++/// (`VICTORY_RAW_OWN_COPY=1`; off by default). The host takes a raw view
++/// on 16 bytes only and removes the device for another (upstream #3540);
++/// the console takes any dword. Such a view was refused
++/// ([`buffer_view_refusal`]) and its slot read zeros: "buffer view the host
++/// would refuse left null ... first=2 count=72 ... raw=true" in the runs of
++/// 2026-11-27 and 28, a 288-byte block 8 bytes off 16 in a 4 MiB window.
++fn raw_own_copy() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_OWN_COPY").is_some_and(|v| v == "1"))
++}
++
++/// Whether a buffer view with these fields is a raw view the host could
++/// take: the raw flag (`flag`), no stride, the raw format. As
++/// [`buffer_view_refusal`] asks of a raw view, but for where it starts.
++fn raw_view(flag: bool, stride: u32, format: DXGI_FORMAT) -> bool {
++    flag && stride == 0 && format == DXGI_FORMAT_R32_TYPELESS
++}
++
++/// [`own_bytes`] for a raw view: the title memory (start, bytes) of `count`
++/// dwords from dword `first` of the buffer at `base`, which lies `offset`
++/// bytes into its host copy, when the view is on a dword of that copy (off
++/// one it is [`own_bytes_if`]'s) but not on 16 bytes of it. On a copy of
++/// its own bytes it starts at byte 0. `None`: the view is made on its
++/// buffer's copy, as every other.
++fn raw_own_bytes_if(on: bool, offset: u64, base: u64, first: u64, count: u32) -> Option<(u64, u64)> {
++    if !on || count == 0 || !offset.is_multiple_of(4) {
++        return None;
++    }
++    let within = first.checked_mul(4)?;
++    if offset.checked_add(within)?.is_multiple_of(16) {
++        return None;
++    }
++    Some((base.checked_add(within)?, u64::from(count) * 4))
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -2339,9 +2484,10 @@ fn own_bytes_if(
+ }
+ 
+ /// Of a buffer view: its first element, its elements, the bytes of one (a
+-/// raw view's: 4), its structure's stride, and whether it has no format.
++/// raw view's: 4), its structure's stride, whether it has no format, and
++/// whether it is a raw view ([`raw_view`]).
+ /// As [`buffer_srv`] and [`buffer_uav`] read them from the same words.
+-fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
++fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool, bool)> {
+     const BUFFER: u32 = 1;
+     let (words, unordered): (&[u32; 10], bool) = match view {
+         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
+@@ -2360,12 +2506,14 @@ fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
+         } else {
+             crate::resource::element(d.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+         };
+-        Some((b.FirstElement, b.NumElements, element, b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN))
++        let raw = raw_view(b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, b.StructureByteStride, d.Format);
++        Some((b.FirstElement, b.NumElements, element, b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN, raw))
+     } else {
+         let d = srv_desc(words);
+         // SAFETY: a buffer view's union member.
+         let b = unsafe { d.Anonymous.Buffer };
+-        Some((b.FirstElement, b.NumElements, element_size(&d), b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN))
++        let raw = raw_view(b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, b.StructureByteStride, d.Format);
++        Some((b.FirstElement, b.NumElements, element_size(&d), b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN, raw))
+     }
+ }
+ 
+@@ -2397,19 +2545,36 @@ fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64,
+ /// without the raw flag, with strides the host has no structured buffers
+ /// for. Since every buffer view of the heap is made for shaders that pick
+ /// them by index, one such view ended the run (2026-11-24, run 10).
++#[cfg(test)]
+ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bool, width: u64) -> bool {
++    buffer_view_refusal(format, first, count, stride, raw, width).is_none()
++}
++
++/// Why the host refuses a buffer view with these fields ([`buffer_view_ok`]):
++/// the index of the reason in [`REFUSALS`]. `None`: it takes the view.
++fn buffer_view_refusal(
++    format: DXGI_FORMAT,
++    first: u64,
++    count: u32,
++    stride: u32,
++    raw: bool,
++    width: u64,
++) -> Option<usize> {
+     use crate::resource::family;
+     let f = format.0 as u32;
+     let element = if raw {
+         // raw: R32 typeless, counted in dwords, starting on 16 bytes
+-        if format != DXGI_FORMAT_R32_TYPELESS || stride != 0 || !first.is_multiple_of(4) {
+-            return false;
++        if format != DXGI_FORMAT_R32_TYPELESS || stride != 0 {
++            return Some(1);
++        }
++        if !first.is_multiple_of(4) {
++            return Some(0);
+         }
+         4
+     } else if stride > 0 {
+         // structured: no format, a stride the host takes
+         if format != DXGI_FORMAT_UNKNOWN || stride > 2048 || !stride.is_multiple_of(4) {
+-            return false;
++            return Some(2);
+         }
+         u64::from(stride)
+     } else {
+@@ -2417,14 +2582,17 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
+         let typeless = family(f) == f && family(f + 1) == f;
+         match crate::resource::element(f) {
+             Some((bytes, 1)) if f != 0 && !typeless && bytes > 0 => bytes,
+-            _ => return false,
++            _ => return Some(3),
+         }
+     };
+-    count > 0
+-        && first
+-            .checked_add(u64::from(count))
+-            .and_then(|end| end.checked_mul(element))
+-            .is_some_and(|end| end <= width)
++    if count == 0 {
++        return Some(4);
++    }
++    let fits = first
++        .checked_add(u64::from(count))
++        .and_then(|end| end.checked_mul(element))
++        .is_some_and(|end| end <= width);
++    (!fits).then_some(5)
+ }
+ 
+ fn buffer_srv(
+@@ -2435,13 +2603,24 @@ fn buffer_srv(
+ ) -> Option<Kept> {
+     let shadow = crate::shadow::find(address, len)?;
+     let offset = shadow.offset(address);
++    // The title memory the view reads, for the log of refused views.
++    let title = {
++        // SAFETY: a buffer view's union member.
++        let b = unsafe { desc.Anonymous.Buffer };
++        let element = element_size(&desc);
++        (
++            address.wrapping_add(b.FirstElement.wrapping_mul(element)),
++            u64::from(b.NumElements) * element,
++        )
++    };
+     // Off the elements of that copy: on a copy of its own bytes, from its
+     // element 0 (`own_bytes`).
+     let (shadow, offset) = {
+         // SAFETY: a buffer view's union member.
+         let b = unsafe { desc.Anonymous.Buffer };
+         let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
+-        match own_bytes(offset, address, b.FirstElement, b.NumElements, element_size(&desc), b.StructureByteStride, unknown)
++        let raw = raw_view(b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, b.StructureByteStride, desc.Format);
++        match own_bytes(offset, address, b.FirstElement, b.NumElements, element_size(&desc), b.StructureByteStride, unknown, raw)
+             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
+         {
+             Some(own) => {
+@@ -2480,13 +2659,16 @@ fn buffer_srv(
+             return None;
+         }
+         buffer.FirstElement += offset / element;
++        if desc.Format == DXGI_FORMAT_UNKNOWN && buffer.StructureByteStride > 0 {
++            STRUCTURED_LEFT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
+     }
+     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
+     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+     // SAFETY: a live buffer.
+     let width = unsafe { shadow.buffer.GetDesc() }.Width;
+-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+-        REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    if let Some(kind) = buffer_view_refusal(desc.Format, first, count, stride, raw, width) {
++        note_refused(kind, false, title, desc.Format, first, count, stride, width);
+         once!(
+             format = desc.Format.0,
+             first,
+@@ -2523,6 +2705,9 @@ fn buffer_uav(
+     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+ ) -> Option<Kept> {
+     let shadow = crate::shadow::find(address, len)?;
++    // The title memory the view reads (set below), for the log of refused
++    // views.
++    let title;
+     // Off the elements of that copy: on a copy of its own bytes, from its
+     // element 0 (`own_bytes`).
+     let (shadow, own) = {
+@@ -2535,8 +2720,13 @@ fn buffer_uav(
+         } else {
+             crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+         };
++        title = (
++            address.wrapping_add(b.FirstElement.wrapping_mul(element)),
++            u64::from(b.NumElements) * element,
++        );
+         let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
+-        match own_bytes(shadow.offset(address), address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown)
++        let raw = raw_view(b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, b.StructureByteStride, desc.Format);
++        match own_bytes(shadow.offset(address), address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown, raw)
+             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
+         {
+             Some(own) => {
+@@ -2577,6 +2767,9 @@ fn buffer_uav(
+             return None;
+         }
+         buffer.FirstElement += offset / element;
++        if desc.Format == DXGI_FORMAT_UNKNOWN && buffer.StructureByteStride > 0 {
++            STRUCTURED_LEFT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
+     }
+     buffer.CounterOffsetInBytes = 0;
+     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
+@@ -2589,8 +2782,8 @@ fn buffer_uav(
+     }
+     // SAFETY: a live buffer.
+     let width = unsafe { shadow.buffer.GetDesc() }.Width;
+-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+-        REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    if let Some(kind) = buffer_view_refusal(desc.Format, first, count, stride, raw, width) {
++        note_refused(kind, true, title, desc.Format, first, count, stride, width);
+         once!(
+             format = desc.Format.0,
+             first,
+@@ -3284,6 +3477,29 @@ mod tests {
+         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+     }
+ 
++    /// A refused buffer view names its reason, and the view a raw view off
++    /// 16 bytes becomes on a copy of its own bytes is taken.
++    #[test]
++    fn a_refused_buffer_view_names_its_reason() {
++        let raw = DXGI_FORMAT_R32_TYPELESS;
++        // the view of the runs' log: dword 2 of a 4 MiB copy
++        assert_eq!(buffer_view_refusal(raw, 2, 72, 0, true, 4_194_304), Some(0));
++        assert_eq!(REFUSALS[0], "a raw view not on 16 bytes of its host copy");
++        // the same bytes on their own copy (288 bytes in a buffer of 512)
++        assert_eq!(buffer_view_refusal(raw, 0, 72, 0, true, 512), None);
++        assert_eq!(buffer_view_refusal(DXGI_FORMAT_UNKNOWN, 0, 72, 0, true, 4096), Some(1));
++        assert_eq!(buffer_view_refusal(DXGI_FORMAT_UNKNOWN, 0, 10, 6, false, 4096), Some(2));
++        assert_eq!(buffer_view_refusal(DXGI_FORMAT_UNKNOWN, 0, 10, 0, false, 4096), Some(3));
++        assert_eq!(buffer_view_refusal(raw, 0, 0, 0, true, 4096), Some(4));
++        assert_eq!(buffer_view_refusal(raw, 0, 72, 0, true, 256), Some(5));
++        assert_eq!(REFUSALS.len(), REFUSED_KINDS.len());
++        // the raw views the own-copy rule takes: the flag, no stride, the raw format
++        assert!(raw_view(true, 0, raw));
++        assert!(!raw_view(false, 0, raw));
++        assert!(!raw_view(true, 4, raw));
++        assert!(!raw_view(true, 0, DXGI_FORMAT_R32_FLOAT));
++    }
++
+     /// The queue of textures picked by index serves the slots looked at
+     /// before first, then the newest write and the oldest in turns; a
+     /// slot whose memory is not there is looked at again after
+@@ -3710,7 +3926,34 @@ mod record_print_tests {
+ 
+ #[cfg(test)]
+ mod own_copy_tests {
+-    use super::own_bytes_if;
++    use super::{own_bytes_if, raw_own_bytes_if};
++
++    /// A raw view on a dword of its buffer's copy but not on 16 bytes of it
++    /// (the host takes raw views on 16 only) gets a copy of its own bytes
++    /// with `VICTORY_RAW_OWN_COPY=1`.
++    #[test]
++    fn a_raw_view_off_16_bytes_gets_its_own_bytes() {
++        let base = 0xd_9000_0000u64;
++        // The view of the runs' log: 72 dwords from dword 2 of a buffer at
++        // the start of its copy, 8 bytes off 16.
++        assert_eq!(raw_own_bytes_if(true, 0, base, 2, 72), Some((base + 8, 288)));
++        // The view's own first dword counts with the buffer's place in
++        // the copy: 8 bytes in from dword 0 is off 16, from dword 2 on it.
++        assert_eq!(raw_own_bytes_if(true, 8, base, 0, 72), Some((base, 288)));
++        assert_eq!(raw_own_bytes_if(true, 8, base, 2, 72), None);
++        // On 16 bytes: the buffer's copy, as every other.
++        assert_eq!(raw_own_bytes_if(true, 0, base, 4, 72), None);
++        assert_eq!(raw_own_bytes_if(true, 32, base, 0, 72), None);
++        // Off the copy's dwords: the older rule's case, which gives it.
++        assert_eq!(raw_own_bytes_if(true, 6, base, 0, 72), None);
++        assert_eq!(own_bytes_if(true, 6, base, 0, 72, 4, 0, false), Some((base, 288)));
++        // The older rule alone says nothing of the logged view (it is on
++        // a dword): that view was refused.
++        assert_eq!(own_bytes_if(true, 0, base, 2, 72, 4, 0, false), None);
++        // No elements, or the switch off: as before.
++        assert_eq!(raw_own_bytes_if(true, 0, base, 2, 0), None);
++        assert_eq!(raw_own_bytes_if(false, 0, base, 2, 72), None);
++    }
+ 
+     /// A buffer view gets a copy of its own bytes only when it has no host
+     /// view on its buffer's copy: off that copy's elements, and not a
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index b935848df..0b6de27fe 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -6605,6 +6605,7 @@ impl Meter {
+             );
+         }
+         crate::shadow::exact_line(frames);
++        crate::descriptor::host::refused_line();
+         crate::descriptor::sync_line(frames);
+         late_line(frames);
+         card_clock_line(frames, ms);
+-- 
+2.56.0.windows.3
+

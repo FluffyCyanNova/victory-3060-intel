@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Fri, 27 Nov 2026 19:10:05 +0800
+Subject: [PATCH] VICTORY_SETTLE_ROOM=1: flights get more room before they are
+ settled
+
+Off by default; unset, nothing changes. With the switch on:
+- lists in the air before the flights are settled: 256 -> 512
+  (late_most; a VICTORY_LATE_WAIT_LISTS that is set still wins),
+- changed runs merged under shaders' writes before the merge gives up
+  and settles: 512 -> 4096 (stale_under_flights).
+The values chosen are logged once.
+
+Origin: the SETTLE_ROOM part of fxceless/victory-fork #1451, commit
+06702fe86 (measured there: 4.9 to 6.6 ms a frame of settle waits on the
+submitting thread). Only this part of that commit; its "alt" mode and
+VICTORY_MERGE_RUNS are not taken, and unlike the fork an explicit
+VICTORY_LATE_WAIT_LISTS is not doubled.
+
+Tests: settle_room_tests (4): caps as before without the switch, each
+value with it, an explicit list count wins.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/host.rs | 78 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 76 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index afd625b72..90f2031e2 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2197,10 +2197,84 @@ mod relay_tests {
+ fn late_most() -> usize {
+     static MOST: OnceLock<usize> = OnceLock::new();
+     *MOST.get_or_init(|| {
+-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
++        let set = std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok());
++        late_most_of(set, settle_room())
+     })
+ }
+ 
++/// [`late_most`] from what `VICTORY_LATE_WAIT_LISTS` says (`set`) and
++/// whether the flights get more room ([`settle_room`]): a value that is
++/// set is taken as it is, the default of 256 is doubled with more room.
++fn late_most_of(set: Option<usize>, room: bool) -> usize {
++    match set {
++        Some(most) => most.max(1),
++        None if room => 512,
++        None => 256,
++    }
++}
++
++/// The most changed runs the merge under shaders' writes puts in before
++/// it gives up and the flights are settled ([`stale_under_flights`]): 512,
++/// eight times that with more room ([`settle_room`]).
++fn merge_runs_of(room: bool) -> usize {
++    if room { 4096 } else { 512 }
++}
++
++/// Whether the flights get more room before they are settled
++/// (`VICTORY_SETTLE_ROOM=1`; off by default): twice the lists in the air
++/// ([`late_most`], unless `VICTORY_LATE_WAIT_LISTS` names a value) and
++/// eight times the changed runs merged under shaders' writes
++/// ([`stale_under_flights`]). The values chosen are said once in the log.
++///
++/// The idea and its measurement (the submitting thread waited 4.9 to
++/// 6.6 ms a frame in these two settles) are from fxceless/victory-fork
++/// #1451, commit 06702fe86; only this part of that commit is here. Watch
++/// the tables line ("N refused": dynamic slots are held while lists fly)
++/// and the card's time (each merged run is a copy of its own there).
++fn settle_room() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| {
++        let on = std::env::var("VICTORY_SETTLE_ROOM").is_ok_and(|v| v.trim() == "1");
++        if on {
++            let set = std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok());
++            tracing::info!(
++                lists_in_the_air = late_most_of(set, true),
++                changed_runs_merged = merge_runs_of(true),
++                "flights get more room before they are settled (VICTORY_SETTLE_ROOM=1)"
++            );
++        }
++        on
++    })
++}
++
++#[cfg(test)]
++mod settle_room_tests {
++    use super::{late_most_of, merge_runs_of};
++
++    #[test]
++    fn without_the_switch_the_caps_are_as_before() {
++        assert_eq!(late_most_of(None, false), 256);
++        assert_eq!(merge_runs_of(false), 512);
++    }
++
++    #[test]
++    fn more_room_doubles_the_lists_in_the_air() {
++        assert_eq!(late_most_of(None, true), 512);
++    }
++
++    #[test]
++    fn more_room_merges_eight_times_the_changed_runs() {
++        assert_eq!(merge_runs_of(true), 4096);
++    }
++
++    #[test]
++    fn a_value_that_is_set_for_the_lists_wins_over_more_room() {
++        assert_eq!(late_most_of(Some(128), true), 128);
++        assert_eq!(late_most_of(Some(128), false), 128);
++        assert_eq!(late_most_of(Some(0), true), 1);
++    }
++}
++
+ /// Whether a submission with bottom-of-pipe writes may fly
+ /// (`VICTORY_LATE_WAIT_WRITES=0`: it is settled as soon as it is sent, so
+ /// the title is told at once, as before; for telling a title that polls
+@@ -2434,7 +2508,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
+         // settle is still due where that could not be done. At most this
+         // many changed runs go up to copies in the card's memory, each a
+         // copy of its own there.
+-        let mut runs_left = 512;
++        let mut runs_left = merge_runs_of(settle_room());
+         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+     }
+     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+-- 
+2.56.0.windows.3
+

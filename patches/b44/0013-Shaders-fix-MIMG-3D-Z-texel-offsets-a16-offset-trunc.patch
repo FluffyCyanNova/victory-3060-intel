@@ -1,0 +1,563 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 00:38:21 +0100
+Subject: [PATCH 13/43] Shaders: fix MIMG 3D Z texel offsets, a16 offset
+ truncation, and cubemap sample_d LOD
+
+Fix three MIMG texture-sampling bugs in `Lower::image`:
+
+1. **a16 offset truncation**: `offset_word` read `addr_val(self, 0)` instead
+   of `addr_u32(self, 0)`. Because `addr_val` masks to 16 bits when `a16`
+   is set, bits `[21:16]` (the 3D Z offset) were zeroed on `a16` samples.
+2. **Dropped 3D Z texel offset & non-sample-60 constant folding**: Offset
+   extraction capped at `.min(2)`, silently dropping the Z offset (`bits
+   [21:16]`) on 3D textures (`offsets == 3`). Furthermore, folding constant
+   offset words in `-8..=7` to DXIL immediate constants only ran inside the
+   pixel `op == 60` arm, leaving `image_sample_lz_o` (`op == 62`) and
+   compute `image_sample_o` with non-immediate offsets rejected by `dxil.dll`.
+   Move constant-offset folding into the shared `offset_word` block and
+   extract all `offsets` axes (X, Y, Z).
+3. **Cubemap `image_sample_d` LOD inflated by `LOG2_E` (`1.4427x`)**: DXIL
+   unary opcode `23` (`dx.op.unary.f32(23, x)`, `Log`) is already base-2
+   logarithm (`log2`), not natural log (`ln`). Multiplying its result by
+   `LOG2_E` pushed every cubemap gradient sample ~1.44x higher in the mip
+   chain.
+
+Add `mimg_3d_sample_offset_preserves_z_and_a16` and
+`mimg_cube_sample_d_selects_exact_log2_mip` (with `#[cfg(test)]`
+`View::Texture3D` and `View::CubeMips` support in `emit::host`) verified
+on hardware D3D12, WARP, and `dxil.dll`.
+
+(cherry picked from commit 61e28e68341492384c95da6596c3e7fc7cce8222)
+(cherry picked from commit c4335bb5bedc77e9ca7d15844dbcd0946f203490)
+---
+ crates/victory-shader/src/emit/host.rs       | 114 ++++++++
+ crates/victory-shader/src/emit/lower.rs      |  65 ++--
+ crates/victory-shader/src/emit/valu_tests.rs | 293 +++++++++++++++++++
+ 3 files changed, 439 insertions(+), 33 deletions(-)
+
+diff --git a/crates/victory-shader/src/emit/host.rs b/crates/victory-shader/src/emit/host.rs
+index 8f5407a97..4e6f0b1e4 100644
+--- a/crates/victory-shader/src/emit/host.rs
++++ b/crates/victory-shader/src/emit/host.rs
+@@ -982,8 +982,12 @@ fn transition(
+ pub enum View<'a> {
+     /// An RGBA32F texture SRV (width, height, texels).
+     Texture(u32, u32, &'a [[f32; 4]]),
++    /// An RGBA32F 3D texture SRV (width, height, depth, texels slice-by-slice).
++    Texture3D(u32, u32, u32, &'a [[f32; 4]]),
+     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
+     Cube(u32, &'a [[f32; 4]]),
++    /// A mipmapped RGBA32F cube SRV (base face size, per-mip 6-face texels).
++    CubeMips(u32, &'a [&'a [[f32; 4]]]),
+     /// A raw buffer UAV of this many dwords, zeroed.
+     RawUav(u32),
+     /// An RGBA32F texture UAV (width, height), zeroed.
+@@ -1224,6 +1228,116 @@ impl Host {
+                         );
+                         keep.push(tex);
+                     }
++                    View::Texture3D(w, h, depth, texels) => {
++                        let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
++                        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
++                        desc.DepthOrArraySize = depth as u16;
++                        let tex = make(
++                            D3D12_HEAP_TYPE_DEFAULT,
++                            &desc,
++                            D3D12_RESOURCE_STATE_COPY_DEST,
++                        )?;
++                        let pitch = (w as usize * 16).next_multiple_of(256);
++                        for z in 0..depth as usize {
++                            let upload = make(
++                                D3D12_HEAP_TYPE_UPLOAD,
++                                &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
++                                D3D12_RESOURCE_STATE_GENERIC_READ,
++                            )?;
++                            let mut p = std::ptr::null_mut();
++                            upload.Map(0, None, Some(&mut p)).map_err(err)?;
++                            let slice = &texels[z * (w * h) as usize..];
++                            for y in 0..h as usize {
++                                let row = &slice[y * w as usize..(y + 1) * w as usize];
++                                std::ptr::copy_nonoverlapping(
++                                    row.as_ptr().cast::<u8>(),
++                                    p.cast::<u8>().add(y * pitch),
++                                    row.len() * 16,
++                                );
++                            }
++                            upload.Unmap(0, None);
++                            list.CopyTextureRegion(
++                                &subresource(&tex),
++                                0,
++                                0,
++                                z as u32,
++                                &footprint(&upload, w, h),
++                                None,
++                            );
++                            keep.push(upload);
++                        }
++                        list.ResourceBarrier(&[transition(
++                            &tex,
++                            D3D12_RESOURCE_STATE_COPY_DEST,
++                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                        )]);
++                        dev.CreateShaderResourceView(&tex, None, at);
++                        keep.push(tex);
++                    }
++                    View::CubeMips(n, mips) => {
++                        let levels = mips.len() as u16;
++                        let mut desc = texture(n, n, D3D12_RESOURCE_FLAG_NONE);
++                        desc.DepthOrArraySize = 6;
++                        desc.MipLevels = levels;
++                        let tex = make(
++                            D3D12_HEAP_TYPE_DEFAULT,
++                            &desc,
++                            D3D12_RESOURCE_STATE_COPY_DEST,
++                        )?;
++                        for (mip, data) in mips.iter().enumerate() {
++                            let s = (n >> mip).max(1);
++                            let pitch = (s as usize * 16).next_multiple_of(256);
++                            for face in 0..6usize {
++                                let upload = make(
++                                    D3D12_HEAP_TYPE_UPLOAD,
++                                    &buffer((pitch * s as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
++                                    D3D12_RESOURCE_STATE_GENERIC_READ,
++                                )?;
++                                let mut p = std::ptr::null_mut();
++                                upload.Map(0, None, Some(&mut p)).map_err(err)?;
++                                let texels = &data[face * (s * s) as usize..];
++                                for y in 0..s as usize {
++                                    let row = &texels[y * s as usize..(y + 1) * s as usize];
++                                    std::ptr::copy_nonoverlapping(
++                                        row.as_ptr().cast::<u8>(),
++                                        p.cast::<u8>().add(y * pitch),
++                                        row.len() * 16,
++                                    );
++                                }
++                                upload.Unmap(0, None);
++                                let mut at_sub = subresource(&tex);
++                                at_sub.Anonymous.SubresourceIndex =
++                                    (mip + face * mips.len()) as u32;
++                                list.CopyTextureRegion(
++                                    &at_sub,
++                                    0,
++                                    0,
++                                    0,
++                                    &footprint(&upload, s, s),
++                                    None,
++                                );
++                                keep.push(upload);
++                            }
++                        }
++                        list.ResourceBarrier(&[transition(
++                            &tex,
++                            D3D12_RESOURCE_STATE_COPY_DEST,
++                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                        )]);
++                        let cube = D3D12_SHADER_RESOURCE_VIEW_DESC {
++                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
++                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
++                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
++                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
++                                TextureCube: D3D12_TEXCUBE_SRV {
++                                    MipLevels: u32::from(levels),
++                                    ..Default::default()
++                                },
++                            },
++                        };
++                        dev.CreateShaderResourceView(&tex, Some(&cube), at);
++                        keep.push(tex);
++                    }
+                     View::RawUav(_) | View::HalfUav(_) => {
+                         // (dwords, format, elements, flags)
+                         let (n, format, elements, flags) = match *v {
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index a4e559cea..24ee44b4d 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -9881,13 +9881,34 @@ impl<'a> Lower<'a> {
+                 *o = zero;
+             }
+             if offset_word && offsets > 0 {
+-                let w = addr_val(self, 0)?;
+-                for (k, at) in [(0, 26), (1, 18)].into_iter().take(offsets.min(2)) {
+-                    // Bits at..at+5 sign-extended: shift up, then down.
+-                    let left = self.s.m.i32(at);
+-                    let t = self.s.m.bin(c, Bin::Shl, w, left);
+-                    let k26 = self.s.m.i32(26);
+-                    os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
++                // The offset word is always 32-bit (6-bit signed X/Y/Z in bits
++                // 0..5, 8..13, 16..21), even under `a16`. DXIL `sample*` ops
++                // require immediate constant offsets in -8..=7; fold constant
++                // words in range directly, and keep dynamic extraction for
++                // programmable gathers / out-of-range offsets.
++                let w = addr_u32(self, 0)?;
++                let folded = self.s.m.int_value(w).and_then(|w| {
++                    let w = w as u32;
++                    let fields: Vec<i32> = (0..offsets)
++                        .map(|k| {
++                            let x = (w >> (8 * k) & 0x3F) as i32;
++                            if x >= 32 { x - 64 } else { x }
++                        })
++                        .collect();
++                    fields.iter().all(|&f| (-8..=7).contains(&f)).then_some(fields)
++                });
++                if let Some(fields) = folded {
++                    for (o, f) in os.iter_mut().zip(fields) {
++                        *o = self.s.m.i32(f as u32);
++                    }
++                } else {
++                    for (k, at) in [(0, 26), (1, 18), (2, 10)].into_iter().take(offsets) {
++                        // Bits at..at+5 sign-extended: shift up, then down.
++                        let left = self.s.m.i32(at);
++                        let t = self.s.m.bin(c, Bin::Shl, w, left);
++                        let k26 = self.s.m.i32(26);
++                        os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
++                    }
+                 }
+             }
+             let mut args = vec![h, sh];
+@@ -9921,27 +9942,6 @@ impl<'a> Lower<'a> {
+                     )
+                 }
+                 60 => {
+-                    if offset_word {
+-                        // DXIL wants immediate offsets in -8..=7 here; the
+-                        // console's are 6-bit and may be computed. A
+-                        // constant word in range becomes immediates
+-                        // (upstream PR #634); anything else keeps the
+-                        // offsets computed above (upstream refuses those).
+-                        let w = addr_val(self, 0)?;
+-                        if let Some(w) = self.s.m.int_value(w) {
+-                            let w = w as u32;
+-                            let field = |k: usize| {
+-                                let x = (w >> (8 * k) & 0x3F) as i32;
+-                                if x >= 32 { x - 64 } else { x }
+-                            };
+-                            let n = offsets.min(2);
+-                            if (0..n).all(|k| (-8..=7).contains(&field(k))) {
+-                                for (k, o) in os.iter_mut().enumerate().take(n) {
+-                                    *o = self.s.m.i32(field(k) as u32);
+-                                }
+-                            }
+-                        }
+-                    }
+                     args.extend(&os);
+                     args.push(clamp);
+                     self.s
+@@ -10011,11 +10011,10 @@ impl<'a> Lower<'a> {
+                     let width = self.s.m.extract(c, d, 0);
+                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
+                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
+-                    // log2 = natural logarithm / ln 2; a length of 0 gives
+-                    // minus infinity, which the sampler clamps to level 0.
+-                    let ln = self.unary(23, texels);
+-                    let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
+-                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
++                    // DXIL unary opcode 23 (`Log`) is base-2 log (`log2`); a
++                    // length of 0 gives minus infinity, which the sampler
++                    // clamps to level 0.
++                    let lod = self.unary(23, texels);
+                     args.extend(&os);
+                     args.push(lod);
+                     self.s.op(
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index 9692bfe95..fa2b4e89c 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -1622,3 +1622,296 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
+         }
+     }
+ }
++
++
++/// MIMG sampled instruction encoding (`r128 = 0`, `nsa = 0`).
++#[allow(clippy::too_many_arguments)]
++const fn mimg_sample(
++    op: u8,
++    dim: u8,
++    dmask: u8,
++    a16: bool,
++    vdata: u8,
++    vaddr: u8,
++    srsrc: u8,
++    ssamp: u8,
++) -> [u32; 2] {
++    [
++        0x3C << 26
++            | (op as u32 & 0x7F) << 18
++            | (dmask as u32 & 0xF) << 8
++            | (dim as u32 & 7) << 3
++            | (op as u32 >> 7 & 1),
++        (a16 as u32) << 30
++            | ((ssamp as u32 >> 2) & 0x1F) << 21
++            | ((srsrc as u32 >> 2) & 0x1F) << 16
++            | (vdata as u32) << 8
++            | vaddr as u32,
++    ]
++}
++
++fn build_sampled_cs(body: &[u32], vgprs: u16) -> HostShader {
++    let mut words = Vec::new();
++    // s[4:5] = view table (SRV at 0, UAV at 8 dwords); s[6:7] = sampler table (offset 0).
++    words.push(s_mov_b32(5, 0x80));
++    words.push(s_mov_b32(7, 0x80));
++    // s_load_dwordx8 s[8:15], s[4:5], 0x0
++    words.extend_from_slice(&[0xF40C_0202, 0xFA00_0000]);
++    // s_load_dwordx4 s[16:19], s[6:7], 0x0
++    words.extend_from_slice(&s_load_dwordx4(16, 6));
++    // s_load_dwordx4 s[20:23], s[4:5], 0x20
++    words.extend_from_slice(&[0xF408_0502, 0xFA00_0020]);
++    words.extend_from_slice(body);
++    words.extend_from_slice(&buffer_store_dword(0, 20, 0));
++    words.push(S_ENDPGM);
++
++    let native = NativeProgram {
++        stage: HwStage::Cs,
++        wave64: false,
++        vgprs,
++        layout: vec![
++            RootParam {
++                root: RootType::Constants,
++                table_offset_dwords: 0,
++                sgprs: 4,
++                base_register: 0,
++                user_data: 0,
++                slot: 0,
++            },
++            RootParam {
++                root: RootType::Table,
++                table_offset_dwords: 0,
++                sgprs: 1,
++                base_register: 0,
++                user_data: 4,
++                slot: 1,
++            },
++            RootParam {
++                root: RootType::Table,
++                table_offset_dwords: 0,
++                sgprs: 1,
++                base_register: 0,
++                user_data: 6,
++                slot: 2,
++            },
++        ],
++        used: vec![
++            UsedResource {
++                kind: ResourceType::Srv,
++                root: RootType::Table,
++                table_offset_dwords: 0,
++                lower_bound: 0,
++                stride: 0,
++                dwords: 8,
++                user_data: 4,
++                slot: 1,
++            },
++            UsedResource {
++                kind: ResourceType::Uav,
++                root: RootType::Table,
++                table_offset_dwords: 8,
++                lower_bound: 0,
++                stride: 4,
++                dwords: 4,
++                user_data: 4,
++                slot: 1,
++            },
++            UsedResource {
++                kind: ResourceType::Sampler,
++                root: RootType::Table,
++                table_offset_dwords: 0,
++                lower_bound: 0,
++                stride: 0,
++                dwords: 4,
++                user_data: 6,
++                slot: 2,
++            },
++        ],
++        io: StageIo::Cs(ComputeIo {
++            rsrc2: 7 << 1,
++            threads: [1, 1, 1],
++        }),
++        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++    };
++    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
++    let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
++    let io = io::raise(&p, &native).unwrap();
++    let st = structure::structure(&p).unwrap();
++    let l = lower::lower(&lower::Parts {
++        native: &native,
++        p: &p,
++        st: &st,
++        io: &io,
++        res: &res,
++        inputs: Vec::new(),
++        outputs: Vec::new(),
++        prims: Vec::new(),
++        mesh_stride: 0,
++    })
++    .unwrap();
++    let mut dxil = l.dxil;
++    #[cfg(windows)]
++    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
++        v.validate(&mut dxil).unwrap();
++    }
++    HostShader {
++        stage: HwStage::Cs,
++        dxil,
++        user_data: l.user_data,
++        samplers: l.samplers,
++        static_samplers: Vec::new(),
++        root_cbvs: l.root_cbvs,
++        root_srvs: l.root_srvs,
++        root_uavs: l.root_uavs,
++        root_indexed_views: Vec::new(),
++    }
++}
++
++#[test]
++fn mimg_3d_sample_offset_preserves_z_and_a16() {
++    // 4x4x4 3D texture: texel (x, y, z) stores R = z*100 + y*10 + x.
++    let mut texels = Vec::with_capacity(64);
++    for z in 0..4u32 {
++        for y in 0..4u32 {
++            for x in 0..4u32 {
++                texels.push([(z * 100 + y * 10 + x) as f32, 0.0, 0.0, 1.0]);
++            }
++        }
++    }
++    // Base coordinate = texel (1, 1, 2) -> (u, v, w) = (0.375, 0.375, 0.625).
++    // Exact in both f32 and f16: 0.375 = 0x3600, 0.625 = 0x3900.
++    // Test offsets: (+1, +2, -1) -> (2, 3, 1) = 132; (-1, +1, +1) -> (0, 2, 3) = 320.
++    let offset_cases: &[(u32, f32, &str)] = &[
++        (0x003F_0201, 132.0, "(+1, +2, -1)"),
++        (0x0001_013F, 320.0, "(-1, +1, +1)"),
++    ];
++    for &(off_word, want, label) in offset_cases {
++        for a16 in [false, true] {
++            let mut body = Vec::new();
++            // v2 = constant 32-bit offset word (always 32-bit even under a16).
++            body.extend_from_slice(&[vop1(0x001, 2, 0xFF), off_word]);
++            if a16 {
++                // v3 = (v=0.375_f16 << 16) | u=0.375_f16; v4 = w=0.625_f16.
++                body.extend_from_slice(&[vop1(0x001, 3, 0xFF), 0x3600_3600]);
++                body.extend_from_slice(&[vop1(0x001, 4, 0xFF), 0x0000_3900]);
++            } else {
++                body.extend_from_slice(&[vop1(0x001, 3, 0xFF), 0.375f32.to_bits()]);
++                body.extend_from_slice(&[vop1(0x001, 4, 0xFF), 0.375f32.to_bits()]);
++                body.extend_from_slice(&[vop1(0x001, 5, 0xFF), 0.625f32.to_bits()]);
++            }
++            // image_sample_lz_o (0x37), dim=2 (3D), dmask=1, v0, v[2..], s[8:15], s[16:19].
++            body.extend_from_slice(&mimg_sample(0x37, 2, 1, a16, 0, 2, 8, 16));
++            let shader = build_sampled_cs(&body, 8);
++
++            #[cfg(windows)]
++            {
++                use windows::Win32::Graphics::Direct3D12::*;
++                let sampler = [D3D12_SAMPLER_DESC {
++                    Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
++                    AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
++                    AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
++                    AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
++                    MaxAnisotropy: 1,
++                    MaxLOD: f32::MAX,
++                    ..Default::default()
++                }];
++                let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
++                for (backend, warp) in [("hardware", false), ("WARP", true)] {
++                    let Ok(host) = Host::new(warp) else {
++                        continue;
++                    };
++                    let (root, pso) = host.compute_pipeline(&shader).unwrap();
++                    let out = host
++                        .dispatch(
++                            &root,
++                            &pso,
++                            &Dispatch {
++                                roots: vec![(0, Root::Constants(vec![0; 7]))],
++                                views: &[View::Texture3D(4, 4, 4, &texels), View::RawUav(16)],
++                                samplers: &sampler,
++                                groups: [1, 1, 1],
++                            },
++                        )
++                        .unwrap();
++                    let got = f32::from_bits(out[0][0]);
++                    assert_eq!(
++                        got, want,
++                        "{backend}: 3D image_sample_lz_o a16={a16} offset {label} got {got}, want {want}",
++                    );
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn mimg_cube_sample_d_selects_exact_log2_mip() {
++    // 8x8 mipmapped cubemap (4 mips: 8, 4, 2, 1); every texel in mip m has R = m as f32.
++    let m0 = vec![[0.0f32, 0.0, 0.0, 1.0]; 6 * 8 * 8];
++    let m1 = vec![[1.0f32, 0.0, 0.0, 1.0]; 6 * 4 * 4];
++    let m2 = vec![[2.0f32, 0.0, 0.0, 1.0]; 6 * 2 * 2];
++    let m3 = vec![[3.0f32, 0.0, 0.0, 1.0]; 6];
++    let mips: [&[[f32; 4]]; 4] = [&m0, &m1, &m2, &m3];
++
++    // image_sample_d (0x22), dim=3 (cube), dmask=1, a16=false:
++    // v1=ddx_s (from s0), v2=ddx_t=0, v3=ddy_s=0, v4=ddy_t=0, v5=s=1.5, v6=t=1.5, v7=face=0.0 (+X).
++    let mut body = Vec::new();
++    body.push(vop1(0x001, 1, sgpr(0)));
++    for r in 2..=4u8 {
++        body.push(vop1(0x001, r, 0x80)); // 0.0
++    }
++    body.extend_from_slice(&[vop1(0x001, 5, 0xFF), 1.5f32.to_bits()]);
++    body.extend_from_slice(&[vop1(0x001, 6, 0xFF), 1.5f32.to_bits()]);
++    body.push(vop1(0x001, 7, 0x80)); // face 0 (+X)
++    body.extend_from_slice(&mimg_sample(0x22, 3, 1, false, 0, 1, 8, 16));
++    let shader = build_sampled_cs(&body, 8);
++
++    // With trilinear filtering and mip m filled with m.0, sampleLevel returns the exact LOD.
++    // Face width = 8 -> texels = g * 8 -> expected LOD = log2(g * 8).
++    let cases: &[(f32, f32)] = &[
++        (0.125, 0.0),          // texels = 1 -> log2(1) = 0.0
++        (0.25, 1.0),           // texels = 2 -> log2(2) = 1.0 (before fix: 1.443)
++        (0.353_553_4, 1.5),    // texels = 2*sqrt(2) -> log2 = 1.5 (before fix: 2.164)
++        (0.5, 2.0),            // texels = 4 -> log2(4) = 2.0 (before fix: 2.885)
++    ];
++
++    #[cfg(windows)]
++    {
++        use windows::Win32::Graphics::Direct3D12::*;
++        let sampler = [D3D12_SAMPLER_DESC {
++            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
++            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
++            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
++            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
++            MaxAnisotropy: 1,
++            MaxLOD: f32::MAX,
++            ..Default::default()
++        }];
++        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
++        for (backend, warp) in [("hardware", false), ("WARP", true)] {
++            let Ok(host) = Host::new(warp) else {
++                continue;
++            };
++            let (root, pso) = host.compute_pipeline(&shader).unwrap();
++            for &(g, want) in cases {
++                let out = host
++                    .dispatch(
++                        &root,
++                        &pso,
++                        &Dispatch {
++                            roots: vec![(0, Root::Constants(vec![g.to_bits(), 0, 0, 0, 0, 0, 0]))],
++                            views: &[View::CubeMips(8, &mips), View::RawUav(16)],
++                            samplers: &sampler,
++                            groups: [1, 1, 1],
++                        },
++                    )
++                    .unwrap();
++                let got = f32::from_bits(out[0][0]);
++                assert!(
++                    (got - want).abs() < 0.05,
++                    "{backend}: cube image_sample_d g={g} returned LOD {got}, want {want}",
++                );
++            }
++        }
++    }
++}

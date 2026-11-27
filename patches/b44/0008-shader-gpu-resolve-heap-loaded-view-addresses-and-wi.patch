@@ -1,0 +1,421 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 15:23:30 +1000
+Subject: [PATCH 08/43] shader,gpu: resolve heap-loaded view addresses and
+ widen native complement masks
+
+Ray-tracing shadow-mask trace programs read 64-bit title buffer addresses
+from descriptors loaded out of the bindless resource heap (or dynamically
+indexed tables) rather than static descriptor tables. Previously
+Lower::view_address only handled static tables, failing those shaders with
+'a descriptor read only as data'.
+
+Add a per-view-heap buffer-address table (SLOT_VIEW_ADDRESSES = 252,
+SLOT_STRIDES_COUNT pairs of (lo, hi) dwords) maintained in HostHeap::mirror
+and bound as a root SRV in victory-gpu, and read it from Lower::view_address
+for ResourceHeap and dynamically indexed Table loads.
+
+Also allow native wave32/wave64 compute shaders (MaskData::Console,
+!local) to check all_lane_blocks and trigger widen() on MASK_ELSEWHERE
+when a complement mask sits inside a per-lane skip, unlocking the final
+ray-tracing shadow-mask trace program and bringing all 64 BVH trace
+programs to 64/64 emitted and DXIL-validated.
+
+(cherry picked from commit ea40c9a9ca721011c850ca36b2d8f2dc65ef25ce)
+---
+ crates/victory-gpu/src/descriptor/host.rs |  56 +++++++++
+ crates/victory-gpu/src/draw.rs            |  39 +++++++
+ crates/victory-gpu/src/pipeline/host.rs   |   1 +
+ crates/victory-shader/src/emit/lower.rs   | 136 +++++++++++++++++-----
+ crates/victory-shader/src/emit/mod.rs     |  13 ++-
+ crates/victory-shader/src/emit/shader.rs  |   7 ++
+ 6 files changed, 219 insertions(+), 33 deletions(-)
+
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 4d2a620c2..cf0e23a94 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -58,6 +58,11 @@ pub(crate) struct HostHeap {
+     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
+     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
+     strides: Option<(ID3D12Resource, u64, usize)>,
++    /// View heaps: the 64-bit title GPU address of the buffer view at each
++    /// title slot (`victory_shader::emit::SLOT_VIEW_ADDRESSES`): an upload
++    /// buffer of `SLOT_STRIDES_COUNT` pairs of dwords (lo, hi), its GPU
++    /// address and its mapping.
++    addresses: Option<(ID3D12Resource, u64, usize)>,
+     /// Title slots holding buffer views. Such a view gets its host slot
+     /// (and its memory a host copy) only when something reads it: a draw
+     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
+@@ -951,6 +956,19 @@ impl HostHeap {
+                 Some((buffer, gpu, data as usize))
+             })
+             .flatten();
++        let addresses = (!sampler)
++            .then(|| {
++                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 8;
++                let (buffer, data) = host.upload_buffer(bytes)?;
++                // SAFETY: the buffer's whole mapping; a live buffer.
++                let gpu = unsafe {
++                    std::ptr::write_bytes(data, 0, bytes as usize);
++                    buffer.GetGPUVirtualAddress()
++                };
++                crate::host::name(&buffer, || "buffer addresses by view heap slot".to_owned());
++                Some((buffer, gpu, data as usize))
++            })
++            .flatten();
+         let h = HostHeap {
+             heap,
+             cpu,
+@@ -965,6 +983,7 @@ impl HostHeap {
+             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+             strides,
++            addresses,
+             buffers: Mutex::default(),
+             changed: Mutex::default(),
+             textures: Mutex::default(),
+@@ -1127,6 +1146,17 @@ impl HostHeap {
+         self.strides.as_ref().map(|s| &s.0)
+     }
+ 
++    /// The GPU address of the table of buffer addresses by title slot (view
++    /// heaps).
++    pub(crate) fn addresses_gpu(&self) -> Option<u64> {
++        self.addresses.as_ref().map(|a| a.1)
++    }
++
++    /// The buffer-address table's buffer, for a list to hold.
++    pub(crate) fn addresses_buffer(&self) -> Option<&ID3D12Resource> {
++        self.addresses.as_ref().map(|a| &a.0)
++    }
++
+     /// Up to `max` title slots whose texture view is due at `frame`, each
+     /// with its write number, in the order to serve them
+     /// ([`TextureQueue::due`]), and the queue's counts
+@@ -1612,6 +1642,17 @@ impl HostHeap {
+             // dword, either value is one the slot had).
+             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+         }
++        let address = view.and_then(view_address).unwrap_or(0);
++        if let Some((_, _, data)) = &self.addresses
++            && index < victory_shader::emit::SLOT_STRIDES_COUNT
++        {
++            // SAFETY: inside the mapping (2 dwords per slot).
++            unsafe {
++                let p = (*data as *mut u32).add(index as usize * 2);
++                p.write_volatile(address as u32);
++                p.add(1).write_volatile((address >> 32) as u32);
++            }
++        }
+         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+         let was = if stride.is_some() {
+             buffers.insert(index);
+@@ -2068,6 +2109,21 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
+     }
+ }
+ 
++/// The 64-bit title GPU virtual address a buffer or constant-buffer view
++/// points at (`victory_shader::emit::SLOT_VIEW_ADDRESSES`).
++fn view_address(view: &View) -> Option<u64> {
++    if let Some((addr, _)) = buffer_range(view) {
++        return Some(addr);
++    }
++    match view {
++        View::Shader(r, None) | View::Unordered(r, _, None) => {
++            crate::resource::buffer_bytes(*r as crate::object::This).map(|(p, _)| p as u64)
++        }
++        View::Constant(addr, _) => Some(*addr),
++        _ => None,
++    }
++}
++
+ /// The title memory a buffer shader or unordered access view reads: its
+ /// address and length.
+ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index f2747eafb..661aac7bd 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -1075,6 +1075,24 @@ impl State {
+                         }
+                         continue;
+                     }
++                    if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
++                        // Ours: the title GPU addresses of buffer views in the
++                        // bound view heap, for shaders that read descriptors as
++                        // pointers from the heap.
++                        match self.heap_addresses(list) {
++                            // SAFETY: an open list; the table lives as long
++                            // as the heap the list holds.
++                            Some(gpu) => unsafe {
++                                if compute {
++                                    l.SetComputeRootShaderResourceView(param, gpu);
++                                } else {
++                                    l.SetGraphicsRootShaderResourceView(param, gpu);
++                                }
++                            },
++                            None => once!("a shader reads view addresses from a view heap that is not set"),
++                        }
++                        continue;
++                    }
+                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
+                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                     else {
+@@ -1353,6 +1371,27 @@ impl State {
+         true
+     }
+ 
++    /// The GPU address of the bound view heap's buffer-address table
++    /// (`victory_shader::emit::SLOT_VIEW_ADDRESSES`), keeping its buffer alive
++    /// for `list`.
++    fn heap_addresses(&self, list: &HostList) -> Option<u64> {
++        let heap = self
++            .heaps
++            .iter()
++            .filter(|&&h| h != 0)
++            .map(|&h| crate::descriptor::heap(h as This))
++            .find(|h| !h.samplers())?;
++        let host = heap.host()?;
++        let gpu = host.addresses_gpu()?;
++        const ONCE: usize = usize::MAX - 0x5f;
++        if list.first_use(ONCE)
++            && let Some(buffer) = host.addresses_buffer()
++        {
++            list.keep(buffer);
++        }
++        Some(gpu)
++    }
++
+     /// For a shader that picks buffers from the view heap by an index it
+     /// computes (SM 6.6 dynamic resources): the GPU address of the heap's
+     /// table of element strides, with every buffer view of the heap given
+diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pipeline/host.rs
+index 9aef7b8f2..0e33780e7 100644
+--- a/crates/victory-gpu/src/pipeline/host.rs
++++ b/crates/victory-gpu/src/pipeline/host.rs
+@@ -436,6 +436,7 @@ impl HostPipeline {
+                     } else {
+                         slot == victory_shader::emit::SLOT_STRIDES
+                             || slot == victory_shader::emit::SLOT_MEMORY
++                            || slot == victory_shader::emit::SLOT_VIEW_ADDRESSES
+                     };
+                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
+                         // A one-view table: the view's size bounds the
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 429e90a70..89d35964e 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -2743,30 +2743,63 @@ impl<'a> Lower<'a> {
+     /// descriptor holds more in the second dword, the stride from bit 16
+     /// up; code that takes the address masks those away.)
+     fn view_address(&mut self, site: Site) -> Option<(V, V)> {
+-        use super::shader::USER_VIEW_ADDRESS;
++        use super::shader::{SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, USER_VIEW_ADDRESS};
+         let a = self.scalar.get(&site).copied()?;
+         let rp = *self.x.native.layout.get(a.param)?;
+-        if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
++        if a.offset % 32 != 0 {
+             return None;
+         }
+-        let dword = a.offset / 4;
+-        let used = self
+-            .x
+-            .native
+-            .used
+-            .iter()
+-            .filter(|u| {
+-                u.root == RootType::Table
+-                    && u.user_data == rp.user_data
+-                    && u.table_offset_dwords <= dword
+-            })
+-            .max_by_key(|u| u.table_offset_dwords)?;
+-        if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
+-            return None;
++        if rp.root == RootType::Table && a.dynamic.is_none() {
++            let dword = a.offset / 4;
++            let used = self
++                .x
++                .native
++                .used
++                .iter()
++                .filter(|u| {
++                    u.root == RootType::Table
++                        && u.user_data == rp.user_data
++                        && u.table_offset_dwords <= dword
++                })
++                .max_by_key(|u| u.table_offset_dwords)?;
++            if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
++                return None;
++            }
++            let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
++            let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
++            return Some((lo, hi));
++        }
++        // A buffer view loaded from the view heap (or a dynamically indexed
++        // table in it): read its 64-bit title address from the host's per-slot
++        // table (`SLOT_VIEW_ADDRESSES`).
++        if matches!(rp.root, RootType::ResourceHeap | RootType::Table) {
++            let slot = self.heap_index(site, 0, false).ok()?;
++            let c = self.cur;
++            let i32t = self.s.t.i32;
++            let last = self.s.m.i32(SLOT_STRIDES_COUNT - 1);
++            let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
++            self.s.m.tag(slot, Tag::Clamp);
++            let three = self.s.m.i32(3);
++            let byte = self.s.m.bin(c, Bin::Shl, slot, three);
++            let h = self.s.root_srv_handle(SLOT_VIEW_ADDRESSES);
++            let iu = self.s.m.undef(i32t);
++            let mask = self.s.m.i8(3);
++            let align = self.s.m.i32(8);
++            let r = self.s.op(
++                c,
++                "rawBufferLoad.f32",
++                Attr::ReadOnly,
++                self.s.t.res_ret,
++                139,
++                &[h, byte, iu, mask, align],
++            );
++            let lo = self.s.m.extract(c, r, 0);
++            let lo = self.as_int(lo);
++            let hi = self.s.m.extract(c, r, 1);
++            let hi = self.as_int(hi);
++            return Some((lo, hi));
+         }
+-        let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
+-        let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
+-        Some((lo, hi))
++        None
+     }
+ 
+     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
+@@ -3115,15 +3148,23 @@ impl<'a> Lower<'a> {
+         };
+         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+         // A mask that holds lanes outside EXEC where it is written (the complement of one,
+-        // say) is the ballot of the lanes that are there: all of them, where two exchanging
+-        // host waves know every lane runs that block.
+-        let made = self.def_block.get(&lo).copied();
+-        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+-        if !self.x.st.active.contains(&lo) && !whole {
+-            if self.exchange.is_some() && !self.local {
+-                need(made.unwrap_or(0));
++        // say) is the ballot of the lanes that are there: all of them, where every lane of
++        // the wave runs that block.
++        if !self.x.st.active.contains(&lo) {
++            let made = self.def_block.get(&lo).copied();
++            let whole = self.mask_data == MaskData::Console
++                && !self.local
++                && made.is_none_or(|b| match &self.exchange {
++                    Some((_, _, all)) => all.get(b).copied().unwrap_or(false),
++                    None => all_lane_blocks(self.x.st)
++                        .is_some_and(|all| all.get(b).copied().unwrap_or(false)),
++                });
++            if !whole {
++                if self.mask_data == MaskData::Console && !self.local {
++                    need(made.unwrap_or(0));
++                }
++                return Err(MASK_ELSEWHERE);
+             }
+-            return Err(MASK_ELSEWHERE);
+         }
+         let (x, y) = match self.ballots.get(&lo) {
+             Some(&xy) => xy,
+@@ -11997,4 +12038,45 @@ mod tests {
+         // A 16-bit float is a half already, sign included.
+         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+     }
++
++    #[test]
++    fn heap_descriptor_address_reads_from_view_address_table() {
++        // Loads a buffer descriptor from the bindless resource heap at a
++        // dynamic byte offset (`s1 << 5`), reads title memory through its
++        // 64-bit address, and stores the dword to LDS.
++        let words = [
++            0xBE84_0300, // s_mov_b32 s4, s0
++            0xBE85_0380, // s_mov_b32 s5, 0
++            0x8F06_8501, // s_lshl_b32 s6, s1, 5
++            0xF408_0202,
++            0x0C00_0000, // s_load_dwordx4 s[8:11], s[4:5], s6
++            0xF400_0304,
++            0xFA00_0000, // s_load_dword s12, s[8:9], null
++            0x7E02_020C, // v_mov_b32 v1, s12
++            0xD834_0000,
++            0x0000_0100, // ds_write_b32 v0, v1
++            S_ENDPGM,
++        ];
++        let layout = vec![
++            root(RootType::ResourceHeap, 0, 0),
++            root(RootType::Constants, 1, 1),
++        ];
++        let l = lower_wave(&words, layout, Vec::new(), false).unwrap();
++        assert!(l.root_srvs.contains(&super::super::SLOT_VIEW_ADDRESSES));
++        assert!(l.root_srvs.contains(&super::super::SLOT_MEMORY));
++    }
++
++    #[test]
++    fn native_wave32_complement_mask_in_all_lanes_block_lowers() {
++        // A complement of EXEC holds lanes outside EXEC, but in an all-lanes
++        // block of a native wave32 compute shader every lane runs the ballot.
++        let words = [
++            0x8802_C17E, // s_xor_b32 s2, exec_lo, -1
++            0x7E02_0202, // v_mov_b32 v1, s2
++            0xD834_0000,
++            0x0000_0100, // ds_write_b32 v0, v1
++            S_ENDPGM,
++        ];
++        lower_wave(&words, Vec::new(), Vec::new(), false).unwrap();
++    }
+ }
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index b215f9182..879a8b6a7 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -115,9 +115,9 @@ pub use sampler::StaticSampler;
+ pub use lower::set_host_max_wave;
+ pub use rect::rect_list_gs;
+ pub use shader::{
+-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+-    set_view_heap_limit, view_heap_limit,
++    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
++    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, USER_DATA_SPACE, USER_MEMORY_BASE,
++    USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
+ };
+ 
+ /// The loop limit without an override: 2^20.
+@@ -508,12 +508,13 @@ pub fn emit(
+         }
+     }
+     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
+-    // trace programs): right once the wave takes that skip together ([`widen`]; the
+-    // lowering has named the skipped blocks).
++    // trace programs), or a mask holding lanes outside EXEC written behind a per-lane skip:
++    // right once the wave takes that skip together ([`widen`]; the lowering has named the
++    // skipped blocks).
+     let original = match original {
+         Err(ShaderError::Unsupported { what, .. })
+             if native.stage == HwStage::Cs
+-                && what == lower::LANE_MASK
++                && (what == lower::LANE_MASK || what == lower::MASK_ELSEWHERE)
+                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
+         {
+             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
+index a81668da3..bdf401ea1 100644
+--- a/crates/victory-shader/src/emit/shader.rs
++++ b/crates/victory-shader/src/emit/shader.rs
+@@ -24,6 +24,13 @@ pub const ROOT_CBV_SPACE: u32 = 1;
+ /// root SRV also tells the host that the buffer views of the whole heap
+ /// must be ready when it runs, not only those its tables name.
+ pub const SLOT_STRIDES: u8 = 255;
++/// The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`] of a shader
++/// that reads a buffer view's title address from the view heap (or a
++/// dynamically indexed descriptor table): a raw buffer of
++/// [`SLOT_STRIDES_COUNT`] pairs of dwords (lo, hi) the host keeps, entry
++/// `i` the 64-bit title GPU virtual address of the buffer view at heap slot
++/// `i` (0: none or not a buffer).
++pub const SLOT_VIEW_ADDRESSES: u8 = 252;
+ /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
+ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+ 

@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Fri, 27 Nov 2026 21:37:20 +0800
+Subject: [PATCH 2/2] VICTORY_HEAD_CAP=1: the head-block cap of fork #1391
+ behind a switch
+
+The commit before this one (fxceless/victory-fork #1391, n-romanovich,
+0c90d72ea: under Rule::Start a view's head block ends with the view
+when that is shorter than HEAD, and a view that ends before the new one
+starts is left alone) is now taken only with VICTORY_HEAD_CAP=1. Unset,
+Rule::Start is as it was: every view that starts within HEAD (4 KiB) of
+a new one goes stale. The switch is said once in the log when it is on.
+
+Why a switch: to compare runs. A run's log counted 202,462 slots "made
+stale by a newer view of other memory there".
+
+Tests: the fork's small_non_overlapping_neighbours_within_head_stay runs
+with the cap on (a thread-local choice for tests);
+without_the_head_cap_small_neighbours_within_head_go_stale holds the
+rule as it was. victory-gpu: 156 passed, 0 failed.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/descriptor/host.rs | 53 +++++++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 01f3e64ca..c14799c22 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -212,6 +212,34 @@ pub(crate) enum Rule {
+ /// none starts closer than 0x2000 to the one before it.)
+ const HEAD: u64 = 4096;
+ 
++/// Whether a view's head block under [`Rule::Start`] ends with the view
++/// when that is shorter than [`HEAD`], and a view that ends before the
++/// new one starts is left alone (`VICTORY_HEAD_CAP=1`; off by default:
++/// every view that starts within `HEAD` of the new one goes stale, as
++/// before). Small views packed within 4 KiB of one another (512-byte tint
++/// palettes) then stop making their neighbours stale. From
++/// fxceless/victory-fork #1391 (n-romanovich).
++fn head_cap() -> bool {
++    #[cfg(test)]
++    if let Some(on) = TEST_HEAD_CAP.get() {
++        return on;
++    }
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        let on = std::env::var("VICTORY_HEAD_CAP").is_ok_and(|v| v.trim() == "1");
++        if on {
++            tracing::info!("a placed texture's head block ends with the texture (VICTORY_HEAD_CAP=1)");
++        }
++        on
++    })
++}
++
++#[cfg(test)]
++thread_local! {
++    /// A test's choice for [`head_cap`], for its thread only.
++    static TEST_HEAD_CAP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
++}
++
+ impl Spans {
+     /// The bytes of title memory a placed texture with the resource
+     /// description `desc` takes (`crate::resource::placed_bytes`).
+@@ -255,6 +283,11 @@ impl Spans {
+         let rule = self.rule;
+         // The spans the view cannot be there with.
+         let clashing: Vec<u64> = match rule {
++            Rule::Start if !head_cap() => self
++                .by_start
++                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
++                .map(|(at, _)| *at)
++                .collect(),
+             Rule::Start => {
+                 // Cap each texture's head block at its own size so small
+                 // neighbouring views packed inside `HEAD` bytes (e.g. tint
+@@ -3462,6 +3495,26 @@ mod tests {
+     /// overlaps.
+     #[test]
+     fn small_non_overlapping_neighbours_within_head_stay() {
++        let was = super::TEST_HEAD_CAP.replace(Some(true));
++        small_neighbours_stay();
++        super::TEST_HEAD_CAP.set(was);
++    }
++
++    /// Without `VICTORY_HEAD_CAP` the rule is as it was: a view that
++    /// starts within `HEAD` of a new one goes stale, overlapping or not.
++    #[test]
++    fn without_the_head_cap_small_neighbours_within_head_go_stale() {
++        let was = super::TEST_HEAD_CAP.replace(Some(false));
++        let mut spans = Spans::default();
++        let at = 0x8_0000_0000u64;
++        assert!(spans.note(1, at, at + 0x200, true).is_empty());
++        assert_eq!(spans.note(2, at + 0x200, at + 0x400, true), [1]);
++        assert_eq!(spans.note(3, at + 0x400, at + 0x800, true), [2]);
++        assert_eq!(spans.slots_in(0, u64::MAX), [3]);
++        super::TEST_HEAD_CAP.set(was);
++    }
++
++    fn small_neighbours_stay() {
+         let mut spans = Spans::default();
+         let at = 0x8_0000_0000u64;
+         assert!(spans.note(1, at, at + 0x200, true).is_empty());
+-- 
+2.56.0.windows.3
+

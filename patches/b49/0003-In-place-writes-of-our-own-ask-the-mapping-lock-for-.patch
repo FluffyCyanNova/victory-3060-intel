@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Thu, 26 Nov 2026 23:44:40 +0800
+Subject: [PATCH 3/3] In-place writes of our own ask the mapping lock for the
+ page they write (fix for the range-scoped lock: the caller on this line named
+ no range)
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/inplace.rs | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/crates/victory-gpu/src/inplace.rs b/crates/victory-gpu/src/inplace.rs
+index 769149007..29cc06564 100644
+--- a/crates/victory-gpu/src/inplace.rs
++++ b/crates/victory-gpu/src/inplace.rs
+@@ -421,7 +421,9 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
+     }
+     // No mapping changes until the bytes are in: the view found below
+     // shows these pages for as long as this is held.
+-    let _still = crate::watch::title_memory_reading_now()?;
++    // (The 64 KiB page of `at`: the range-scoped lock holds still what the
++    // view found below shows there.)
++    let _still = crate::watch::title_memory_reading_now(at - at % K64, K64)?;
+     let (section, offset, shown, section_bytes) = {
+         let v = views();
+         let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;

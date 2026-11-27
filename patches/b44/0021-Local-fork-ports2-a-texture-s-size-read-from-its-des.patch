@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 14:52:08 +0800
+Subject: [PATCH 21/43] Local (fork-ports2): a texture's size read from its
+ descriptor's dwords
+
+Port of e22435ea / 51e28d07 onto a26859f: a heap or table descriptor that nothing
+uses as a descriptor and whose dword 2 or 3 scalar arithmetic reads is taken as a
+2D texture's; its size comes from getDimensions. Unbuilt on this base.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-shader/src/emit/lower.rs | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 74901d57c..2bf2e614c 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -5749,7 +5749,9 @@ impl<'a> Lower<'a> {
+         let (first, props, image, uav, used) = if let Some(kind) = unused {
+             kind
+         } else {
+-        let Some((at, first)) = use_at else {
++        let (at, first, plain) = if let Some((at, first)) = use_at {
++            (at, first, false)
++        } else {
+             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
+             // copies its dwords and compares them, lane against first lane, and every load
+             // that reaches those lanes reads one address. Each dword stands in as its place
+@@ -5806,7 +5808,11 @@ impl<'a> Lower<'a> {
+                     self.x.res.lane_copied.contains(&site)
+                 );
+             }
+-            return Err("a descriptor read only as data");
++            // (local) its size read as numbers: taken as a 2D texture's
++            if !self.size_read(inst, code, count, address.map(|a| a.offset)) {
++                return Err("a descriptor read only as data");
++            }
++            (site, 0, true)
+         };
+         let src = Source::Loaded { load: site, first };
+         let used = self.used_kind(&src);
+@@ -5817,6 +5823,7 @@ impl<'a> Lower<'a> {
+             || used.is_some_and(|u| u.kind == ResourceType::Uav);
+         let u = if uav { 0x1000 } else { 0 };
+         let (props, image) = match &ui.fields {
++            _ if plain => ((2, 0x409), Some(2)),
+             // A ray-tracing structure in a buffer of the host: read raw.
+             Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
+             Fields::Image { dim, .. } => {

@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 07:53:18 +0100
+Subject: [PATCH 25/43] Shaders: view records step 16 bytes, no table offset on
+ the loaded address
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+(cherry picked from commit 41a3892c9e3993fa51009f60e3b43d50fa2d09ce)
+---
+ crates/victory-gpu/src/descriptor/host.rs |  3 +-
+ crates/victory-shader/src/emit/lower.rs   | 36 ++++++++++++++++++++---
+ crates/victory-shader/src/emit/mod.rs     |  2 +-
+ crates/victory-shader/src/emit/shader.rs  |  8 +++--
+ 4 files changed, 41 insertions(+), 8 deletions(-)
+
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index e9caae31c..a21b18d64 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -958,7 +958,8 @@ impl HostHeap {
+             .flatten();
+         let views = (!sampler)
+             .then(|| {
+-                let bytes = u64::from(victory_shader::emit::SLOT_VIEWS_COUNT) * 16;
++                let bytes = u64::from(victory_shader::emit::SLOT_VIEWS_COUNT)
++                    * u64::from(victory_shader::emit::SLOT_VIEWS_RECORD_BYTES);
+                 let (buffer, data) = host.upload_buffer(bytes)?;
+                 // SAFETY: the buffer's whole mapping; a live buffer.
+                 let gpu = unsafe {
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index ce445e769..5c1e29aaa 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -89,6 +89,12 @@ enum Stop {
+     Fail(ShaderError),
+ }
+ 
++/// Shift taking a heap slot to the byte of its [`shader::SLOT_VIEWS`] record.
++fn view_record_shift() -> u32 {
++    debug_assert!(super::shader::SLOT_VIEWS_RECORD_BYTES.is_power_of_two());
++    super::shader::SLOT_VIEWS_RECORD_BYTES.trailing_zeros()
++}
++
+ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+     let mut bad = HashMap::new();
+     loop {
+@@ -2795,8 +2801,8 @@ impl<'a> Lower<'a> {
+         let i32t = self.s.t.i32;
+         let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+         self.s.m.tag(slot, Tag::Clamp);
+-        let three = self.s.m.i32(3);
+-        let byte = self.s.m.bin(c, Bin::Shl, slot, three);
++        let shift = self.s.m.i32(view_record_shift());
++        let byte = self.s.m.bin(c, Bin::Shl, slot, shift);
+         let h = self.s.root_srv_handle(super::shader::SLOT_VIEWS);
+         let iu = self.s.m.undef(self.s.t.i32);
+         let mask = self.s.m.i8(0xF);
+@@ -2819,8 +2825,8 @@ impl<'a> Lower<'a> {
+             self.as_int(len),
+             self.as_int(stride),
+         );
+-        let off = a.offset as i32;
+-        let (lo, hi) = self.address_plus(lo, hi, off);
++        // The loaded address is the view's own: `a.offset` is a place in the
++        // descriptor table (already part of `slot`), not in the buffer.
+         Ok(Some((lo, hi, len, stride)))
+     }
+ 
+@@ -11489,6 +11495,28 @@ mod tests {
+ 
+     const S_ENDPGM: u32 = 0xBF81_0000;
+ 
++    #[test]
++    fn view_records_are_indexed_by_their_sixteen_byte_size() {
++        // The host writes four dwords per slot (address lo/hi, length,
++        // stride); the shader must step 16 bytes, not 8.
++        assert_eq!(super::super::shader::SLOT_VIEWS_RECORD_BYTES, 16);
++        assert_eq!(1u32 << super::view_record_shift(), 16);
++        assert_eq!(5u32 << super::view_record_shift(), 80);
++    }
++
++    #[test]
++    fn view_address_indexed_keeps_the_loaded_address() {
++        // The table offset is part of the slot, not of the buffer address:
++        // the function must not add `a.offset` to what the table holds.
++        let src = include_str!("lower.rs");
++        let body = src
++            .split("fn view_address_indexed")
++            .nth(1)
++            .and_then(|s| s.split("fn address_plus").next())
++            .unwrap();
++        assert!(!body.contains("address_plus("));
++    }
++
+     #[test]
+     fn packed_pixel_inputs_find_their_second_row() {
+         use super::super::container::SigElement;
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 07ecd2421..a62686dff 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -116,7 +116,7 @@ pub use lower::set_host_max_wave;
+ pub use rect::rect_list_gs;
+ pub use shader::{
+     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+-    SLOT_STRIDES_COUNT, SLOT_VIEWS, SLOT_VIEWS_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
++    SLOT_STRIDES_COUNT, SLOT_VIEWS, SLOT_VIEWS_COUNT, SLOT_VIEWS_RECORD_BYTES, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+     USER_VIEW_BIAS,
+     set_view_heap_limit, view_heap_limit,
+ };
+diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
+index 89f872d55..c7f2c10a8 100644
+--- a/crates/victory-shader/src/emit/shader.rs
++++ b/crates/victory-shader/src/emit/shader.rs
+@@ -30,13 +30,17 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+ /// Title addresses of the buffer views of the view heap by slot, for
+ /// console code that reads a descriptor's address out of a table at an
+ /// index it computes (ray-tracing structures and the programs that walk
+-/// them) and finds no root view to ask the host about. Two dwords per
+-/// slot: the title address of the view's first byte. Slots without a
++/// them) and finds no root view to ask the host about. Four dwords per
++/// slot (`SLOT_VIEWS_RECORD_BYTES`): the title address of the view's first
++/// byte (low, high), its byte length and its element stride. Slots without a
+ /// buffer view read zero. Like [`SLOT_STRIDES`], the host readies the
+ /// buffer views of the whole heap when a shader has this root SRV.
+ pub const SLOT_VIEWS: u8 = 252;
+ /// Slots of the [`SLOT_VIEWS`] buffer (heap indices are clamped to it).
+ pub const SLOT_VIEWS_COUNT: u32 = SLOT_STRIDES_COUNT;
++/// Bytes of one [`SLOT_VIEWS`] record (four dwords); a power of two, the
++/// shader indexes it by shifting.
++pub const SLOT_VIEWS_RECORD_BYTES: u32 = 16;
+ 
+ /// Title memory by address (`resource::MEMORY`): console code reads and
+ /// writes through raw 40-bit addresses it takes from root constants,

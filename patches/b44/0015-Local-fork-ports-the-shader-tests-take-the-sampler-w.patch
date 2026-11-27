@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 14:38:54 +0800
+Subject: [PATCH 15/43] Local (fork-ports): the shader tests take the sampler
+ words of the two-slot samplers
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-shader/src/emit/valu_tests.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index fa2b4e89c..a1e429e8d 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -1562,7 +1562,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
+         stage: HwStage::Cs,
+         dxil: lowered.dxil,
+         user_data: lowered.user_data,
+-        samplers: lowered.samplers,
++        samplers: lowered.samplers.iter().map(|&(w, _)| w).collect(),
+         static_samplers: Vec::new(),
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,
+@@ -1758,7 +1758,7 @@ fn build_sampled_cs(body: &[u32], vgprs: u16) -> HostShader {
+         stage: HwStage::Cs,
+         dxil,
+         user_data: l.user_data,
+-        samplers: l.samplers,
++        samplers: l.samplers.iter().map(|&(w, _)| w).collect(),
+         static_samplers: Vec::new(),
+         root_cbvs: l.root_cbvs,
+         root_srvs: l.root_srvs,

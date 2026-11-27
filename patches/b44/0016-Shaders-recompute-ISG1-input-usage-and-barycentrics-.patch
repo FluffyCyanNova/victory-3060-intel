@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Tue, 24 Nov 2026 18:28:38 -0300
+Subject: [PATCH 16/43] Shaders: recompute ISG1 input usage and barycentrics
+ flag after bitcode opt
+
+(cherry picked from commit 442d7c25ab1849a5e25fbf19313ead3c172cddae)
+---
+ crates/victory-shader/src/emit/bitcode/opt.rs | 36 +++++++++++++++++++
+ crates/victory-shader/src/emit/mod.rs         | 23 ++++++++++++
+ crates/victory-shader/src/emit/shader.rs      |  6 ++++
+ 3 files changed, 65 insertions(+)
+
+diff --git a/crates/victory-shader/src/emit/bitcode/opt.rs b/crates/victory-shader/src/emit/bitcode/opt.rs
+index 13551c371..ee446e2d1 100644
+--- a/crates/victory-shader/src/emit/bitcode/opt.rs
++++ b/crates/victory-shader/src/emit/bitcode/opt.rs
+@@ -63,6 +63,8 @@ pub const ALL: u32 = MODULE | FIRST;
+ pub(crate) struct Usage {
+     /// A wave or quad operation.
+     pub wave_ops: bool,
++    /// `dx.op.attributeAtVertex.*` (shader barycentrics).
++    pub barycentrics: bool,
+     /// A 64-bit integer, as a result or an operand.
+     pub int64: bool,
+     /// A typed load of several components from a UAV.
+@@ -1011,6 +1013,8 @@ impl Module {
+                     }
+                 } else if name.starts_with("atomic") && name.ends_with(".i64") {
+                     u.atomic64 = true;
++                } else if name.starts_with("attributeAtVertex") {
++                    u.barycentrics = true;
+                 } else if name.starts_with("textureLoad") || name.starts_with("bufferLoad") {
+                     u.typed_uav_loads |= args.get(1).and_then(|&h| annotation(h)).is_none_or(
+                         |(kind, components)| kind & 0x1000 != 0 && components >> 8 & 0xff > 1,
+@@ -1021,6 +1025,38 @@ impl Module {
+         u
+     }
+ 
++    /// Per input signature element: bitmask of columns actually read by
++    /// reachable `dx.op.loadInput.*` or `dx.op.attributeAtVertex.*` calls.
++    pub(crate) fn input_usage(&self, count: usize) -> Vec<u8> {
++        let mut masks = vec![0u8; count];
++        let reached = self.reached();
++        for (_, blk) in self.blocks.iter().enumerate().filter(|(b, _)| reached[*b]) {
++            for &i in &blk.body {
++                let Op::Call(f, args) = &self.insts[i as usize].op else {
++                    continue;
++                };
++                let name = self.funcs[*f as usize].name.as_str();
++                let name = name.strip_prefix("dx.op.").unwrap_or(name);
++                if !(name.starts_with("loadInput.") || name.starts_with("attributeAtVertex.")) {
++                    continue;
++                }
++                let Some((_, id)) = args.get(1).and_then(|&v| self.int_k(v)) else {
++                    continue;
++                };
++                let Some((_, col)) = args.get(3).and_then(|&v| self.int_k(v)) else {
++                    continue;
++                };
++                if let Ok(id) = usize::try_from(id)
++                    && id < count
++                    && (0..4).contains(&col)
++                {
++                    masks[id] |= 1u8 << col;
++                }
++            }
++        }
++        masks
++    }
++
+     /// A constant table no remaining load reads leaves the module (the
+     /// validator refuses an internal declaration nothing uses). Shared
+     /// memory stays declared whether it is read or not.
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index c2b3b12ff..7b8d37196 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -1856,4 +1856,27 @@ mod barycentric_tests {
+         let words = [0xC812_0000, e0, e1, S_ENDPGM];
+         assert!(pixel(&words, PERSP_CENTER).is_err());
+     }
++
++    /// A dead interpolated channel removed by `bitcode::opt` must not remain
++    /// marked read in `ISG1` (the DXIL validator checks the input signature
++    /// against the surviving `loadInput` / `attributeAtVertex` calls).
++    #[test]
++    fn dead_input_read_is_cleared_from_isg1_after_opt() {
++        let [e0, e1] = exp_mrt0(2);
++        let words = [
++            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
++            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
++            0xC810_0100, // v_interp_p1_f32 v4, v0, attr0.y (dead)
++            0xC811_0101, // v_interp_p2_f32 v4, v1, attr0.y (dead)
++            e0,
++            e1,
++            S_ENDPGM,
++        ];
++        let shader = pixel(&words, PERSP_CENTER).unwrap();
++        let host = Container::parse(&shader.dxil).unwrap();
++        let isg1 = host.part(FourCC::ISG1).unwrap().data;
++        // Row 0's ReadWriteMask byte is at offset 8 (header) + 25.
++        assert_eq!(isg1[8 + 25], 0x1, "dead .y channel left in ISG1 rw mask");
++        validate(&shader);
++    }
+ }
+diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
+index bdf401ea1..1ea3cb445 100644
+--- a/crates/victory-shader/src/emit/shader.rs
++++ b/crates/victory-shader/src/emit/shader.rs
+@@ -467,8 +467,10 @@ impl Shader {
+         if passes != 0 {
+             self.m.optimise(passes);
+             let used = self.m.usage();
++            let has_bary_input = self.inputs.iter().any(|e| e.kind == 28);
+             for (flag, used) in [
+                 (flags::WAVE_OPS, used.wave_ops),
++                (flags::BARYCENTRICS, used.barycentrics || has_bary_input),
+                 (flags::INT64, used.int64),
+                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
+                 (flags::RESOURCE_HEAP, used.heap_views),
+@@ -479,6 +481,10 @@ impl Shader {
+                     self.flags &= !flag;
+                 }
+             }
++            let input_usage = self.m.input_usage(self.inputs.len());
++            for (e, mask) in self.inputs.iter_mut().zip(input_usage) {
++                e.usage = mask;
++            }
+         }
+         let mut resources = None;
+         let mut bindings = Vec::new();

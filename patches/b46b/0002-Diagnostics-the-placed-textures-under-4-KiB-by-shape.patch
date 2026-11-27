@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Thu, 26 Nov 2026 20:14:41 +0800
+Subject: [PATCH 2/2] Diagnostics: the placed textures under 4 KiB by shape,
+ and which the head's cap kept ("small placed textures")
+
+No behaviour change; diagnostics builds only. Every 10 s while it
+changes: how many placed textures smaller than 4 KiB had a view written,
+by format, size and levels, and how many of each the capped head kept
+beside a neighbour within 4 KiB that a full head would have made stale
+(or that would have made them stale). To name the textures behind the
+dark interiors of the run with the cap.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/descriptor/host.rs | 103 ++++++++++++++++++++++
+ crates/victory-gpu/src/resource.rs        |  16 ++++
+ 2 files changed, 119 insertions(+)
+
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index ea1d751e3..f3ba7099a 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -214,6 +214,93 @@ pub(crate) enum Rule {
+ /// none starts closer than 0x2000 to the one before it.)
+ const HEAD: u64 = 4096;
+ 
++/// Diagnostics only, no behaviour: the placed textures smaller than
++/// [`HEAD`] that views were written of, by shape, and which of them the
++/// head's cap kept (a neighbour within 4 KiB that would have made them
++/// stale, or been made stale by them, under a full 4 KiB head). Said every
++/// 10 s while it changes: "small placed textures".
++#[cfg(feature = "diagnostics")]
++mod small {
++    use std::collections::{BTreeMap, HashMap, HashSet};
++    use std::sync::Mutex;
++
++    #[derive(Default)]
++    struct Small {
++        /// By start: the texture's shape and bytes.
++        by_start: HashMap<u64, ([u64; 6], u64)>,
++        /// Starts of textures in a pair the cap kept apart (either size).
++        kept: HashSet<u64>,
++        pairs: u64,
++        changed: bool,
++        said: u64,
++    }
++
++    static SMALL: Mutex<Option<Small>> = Mutex::new(None);
++
++    fn with<R>(f: impl FnOnce(&mut Small) -> R) -> R {
++        f(SMALL.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Small::default))
++    }
++
++    /// A view was written of the texture at `start`, of `bytes` bytes.
++    pub(super) fn seen(start: u64, bytes: u64, desc: &[u32; 14]) {
++        if bytes >= super::HEAD {
++            return;
++        }
++        let shape = crate::resource::placed_shape(desc);
++        with(|s| s.changed |= s.by_start.insert(start, (shape, bytes)) != Some((shape, bytes)));
++    }
++
++    /// The textures at `a` and `b` both stay where a full head would have
++    /// made one stale.
++    pub(super) fn kept(a: u64, b: u64) {
++        with(|s| {
++            s.pairs += 1;
++            let new = s.kept.insert(a) | s.kept.insert(b);
++            s.changed |= new;
++        });
++    }
++
++    pub(super) fn report() {
++        let now = crate::host::now_ms();
++        let lines = with(|s| {
++            if !s.changed || now.saturating_sub(s.said) < 10_000 {
++                return None;
++            }
++            (s.changed, s.said) = (false, now);
++            // By shape: textures, of them kept, and their bytes.
++            let mut shapes: BTreeMap<[u64; 6], (u64, u64, u64)> = BTreeMap::new();
++            for (start, (shape, bytes)) in &s.by_start {
++                let e = shapes.entry(*shape).or_default();
++                e.0 += 1;
++                e.1 += u64::from(s.kept.contains(start));
++                e.2 = *bytes;
++            }
++            let small_kept = s.by_start.keys().filter(|start| s.kept.contains(start)).count();
++            let mut lines = vec![format!(
++                "small placed textures (under 4 KiB) since the start: {} at distinct addresses in {} shapes; the head's cap kept {} of \
++                 them and {} larger neighbours ({} pairs seen)",
++                s.by_start.len(),
++                shapes.len(),
++                small_kept,
++                s.kept.len() - small_kept,
++                s.pairs
++            )];
++            let mut rows: Vec<_> = shapes.into_iter().collect();
++            rows.sort_by_key(|&(_, (n, kept, _))| (std::cmp::Reverse(kept), std::cmp::Reverse(n)));
++            for ([dimension, format, width, height, depth, mips], (n, kept, bytes)) in rows.into_iter().take(48) {
++                lines.push(format!(
++                    "small placed textures: format {format} ({format:#x}) {width}x{height}x{depth} levels {mips} dimension {dimension}, \
++                     {bytes} bytes: {n} textures, {kept} kept by the cap"
++                ));
++            }
++            Some(lines)
++        });
++        for line in lines.into_iter().flatten() {
++            tracing::info!("{line}");
++        }
++    }
++}
++
+ impl Spans {
+     /// The bytes of title memory a placed texture with the resource
+     /// description `desc` takes (`crate::resource::placed_bytes`).
+@@ -268,6 +355,16 @@ impl Spans {
+                 .collect(),
+             Rule::Overlap | Rule::Never => self.overlapping(start, end),
+         };
++        // (Diagnostics: the neighbours a full 4 KiB head would have made
++        // stale and the capped one leaves; counted, nothing else.)
++        #[cfg(feature = "diagnostics")]
++        if newer && rule == Rule::Start {
++            for (&at, _) in self.by_start.range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD)) {
++                if at != start && !clashing.contains(&at) {
++                    small::kept(start, at);
++                }
++            }
++        }
+         let mut stale = Vec::new();
+         for at in clashing {
+             if at == start && same(self.by_start.get(&at)) {
+@@ -1655,8 +1752,14 @@ impl HostHeap {
+                     SPANNED[0].fetch_min(start, Relaxed);
+                     SPANNED[1].fetch_max(end, Relaxed);
+                     placed.rule = stale_rule();
++                    #[cfg(feature = "diagnostics")]
++                    if let Some((resource, ..)) = placed_view {
++                        small::seen(start, end - start, resource);
++                    }
+                     let stale = placed.note(index, start, end, !seen);
+                     placed.shows(index, first);
++                    #[cfg(feature = "diagnostics")]
++                    small::report();
+                     stale
+                 }
+                 None => {
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index db527b5bf..627d12bd9 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -2569,6 +2569,22 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
+     footprint(&d).map(|f| f.size)
+ }
+ 
++/// For a log line: a placed texture's dimension, format, width, height,
++/// depth or layers, and levels, from its description as words.
++#[cfg(feature = "diagnostics")]
++pub(crate) fn placed_shape(desc: &[u32; 14]) -> [u64; 6] {
++    // SAFETY: 56 bytes in the description's layout.
++    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
++    [
++        u64::from(d.dimension),
++        u64::from(d.format),
++        d.width,
++        u64::from(d.height),
++        u64::from(d.depth_or_array_size),
++        u64::from(d.mip_levels),
++    ]
++}
++
+ /// The resource [`texture_at`] made for a texture placed at `address` with
+ /// the description `desc`, if it has made one: never made here (for the
+ /// frame listing, which must not count as a use).

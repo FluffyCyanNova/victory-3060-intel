@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Thu, 26 Nov 2026 23:56:44 +0800
+Subject: [PATCH 13/13] Texture copy-back: diagnostics builds say which
+ pipeline writes each kind copied back
+
+The kinds in VICTORY_TEXTURE_BACK are chosen by size and format alone, so a
+texture that is not the ocean's is copied back with the ocean's (run b51run1:
+lighting changed with all four kinds on). With the switch set, diagnostics
+builds now log once per kind and pipeline:
+"texture back: a texture of a kind copied back is written by this pipeline"
+with width, height, format, resource, frame and the pipeline's name (the one
+whose tables the recording thread walked last). Nothing without the switch,
+nothing in builds without diagnostics.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+(cherry picked from commit e1c1cba1d807fa9483736b6debec22c2ea091d68)
+---
+ crates/victory-gpu/src/draw.rs    | 11 +++++++++
+ crates/victory-gpu/src/texback.rs | 39 +++++++++++++++++++++++++++++++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 6818061b4..0cdc4109a 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -70,6 +70,11 @@ thread_local! {
+     /// milliseconds and the bytes that run may take, in place of the
+     /// pass's own per frame.
+     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
++    /// With `VICTORY_TEXTURE_BACK` set: the name of the pipeline whose
++    /// tables are being walked, for the line that says which pipeline
++    /// writes a texture of a kind copied back (`crate::texback::note_writer`).
++    #[cfg(feature = "diagnostics")]
++    static WRITER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+ }
+ 
+ /// The milliseconds of every frame the pass that uploads textures picked
+@@ -1071,6 +1076,10 @@ impl State {
+             list.keep(&p.pso);
+             list.keep(&p.root);
+         }
++        #[cfg(feature = "diagnostics")]
++        if crate::texback::on() {
++            WRITER.with_borrow_mut(|name| name.clone_from(&p.name));
++        }
+         for stage in &p.stages {
+             let t = stage.translated();
+             STORES.set(t.stores);
+@@ -3388,6 +3397,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
+             crate::capture::note_target(*resource as This);
+             // Some compute-written textures are also read by the title CPU.
+             list.texture_written(*resource as This);
++            #[cfg(feature = "diagnostics")]
++            WRITER.with_borrow(|name| crate::texback::note_writer(*resource as This, name));
+             // Unordered access to a depth texture is its colour twin's.
+             if !list.twin_use(*resource as This, true, true) {
+                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+diff --git a/crates/victory-gpu/src/texback.rs b/crates/victory-gpu/src/texback.rs
+index 3102a4f9e..22078e364 100644
+--- a/crates/victory-gpu/src/texback.rs
++++ b/crates/victory-gpu/src/texback.rs
+@@ -58,6 +58,45 @@ pub(crate) fn wanted(resource: This) -> bool {
+         && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
+ }
+ 
++/// Whether any kind is copied back (`VICTORY_TEXTURE_BACK` set).
++#[cfg(feature = "diagnostics")]
++pub(crate) fn on() -> bool {
++    !kinds().is_empty()
++}
++
++/// Diagnostics builds, with `VICTORY_TEXTURE_BACK` set: says once per kind
++/// and pipeline which pipeline writes a texture of a kind copied back
++/// (`pipeline`: the one whose tables the recording thread walked last).
++/// The kinds are chosen by size and format alone, so this is how a kind
++/// that is not the ocean's is told from one that is.
++#[cfg(feature = "diagnostics")]
++pub(crate) fn note_writer(resource: This, pipeline: &str) {
++    /// Pairs said already; no more than this many are kept (or said).
++    const MOST: usize = 256;
++    static SAID: Mutex<Vec<((u64, u32, u32), String)>> = Mutex::new(Vec::new());
++    let kinds = kinds();
++    if kinds.is_empty() {
++        return;
++    }
++    let Some(kind) = crate::resource::texture_kind(resource).filter(|k| kinds.contains(k)) else {
++        return;
++    };
++    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
++    if said.len() >= MOST || said.iter().any(|(k, p)| *k == kind && p == pipeline) {
++        return;
++    }
++    said.push((kind, pipeline.to_owned()));
++    tracing::info!(
++        width = kind.0,
++        height = kind.1,
++        format = kind.2,
++        resource = format_args!("{:#x}", resource as usize),
++        frame = crate::frame::current(),
++        pipeline,
++        "texture back: a texture of a kind copied back is written by this pipeline"
++    );
++}
++
+ /// An outstanding write to a specific allocation. Mapping and resource
+ /// changes invalidate only the writes that could touch the replaced memory.
+ struct Ticket {
+-- 
+2.56.0.windows.3
+

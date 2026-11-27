@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Fri, 27 Nov 2026 22:39:10 +0800
+Subject: [PATCH 2/2] Thread tickets: a group whose shared memory is full takes
+ none
+
+The ticket's counter is one more dword of the group's shared memory. The
+host takes 32 KiB of it per group at most and refuses the pipeline of a
+program that declares more ("The parameter is incorrect"; the validator
+does not check this limit). A program that already has 32 KiB keeps the
+thread ids it had instead of losing its pipeline.
+
+Test: a_group_whose_shared_memory_is_full_takes_no_ticket.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-shader/src/emit/lower_local.rs | 23 +++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-shader/src/emit/lower_local.rs b/crates/victory-shader/src/emit/lower_local.rs
+index ad47d9bf8..673a790eb 100644
+--- a/crates/victory-shader/src/emit/lower_local.rs
++++ b/crates/victory-shader/src/emit/lower_local.rs
+@@ -127,11 +127,22 @@ fn wants_ticket(threads: [u32; 3], wave: u32) -> bool {
+     group > wave && group < 1 << 16 && threads.iter().filter(|&&t| t > 1).count() > 1
+ }
+ 
++/// Whether one more dword fits a thread group's shared memory of
++/// `dwords`: the host takes 32 KiB per group at most and refuses the
++/// pipeline of a program that declares more ("The parameter is
++/// incorrect"; the validator does not check it). A program whose memory
++/// is full keeps the ids it had.
++fn lds_has_room(dwords: u32) -> bool {
++    dwords < 32768 / 4
++}
++
+ /// Reserves the LDS dword of the tickets' counter for a compute program
+ /// with console lanes that is not run in halves (`relabelled`), with
+-/// [`thread_ticket`], where [`wants_ticket`].
++/// [`thread_ticket`], where [`wants_ticket`] and the dword still fits
++/// ([`lds_has_room`]).
+ pub(super) fn take_ticket(s: &mut Shader, relabelled: bool, wave: u32) {
+-    if relabelled && thread_ticket() && s.threads.is_some_and(|t| wants_ticket(t, wave)) {
++    let wanted = relabelled && thread_ticket() && s.threads.is_some_and(|t| wants_ticket(t, wave));
++    if wanted && lds_has_room(s.lds_dwords) {
+         s.ticket = Some(s.lds_dwords);
+         s.lds_dwords += 1;
+     }
+@@ -275,6 +286,14 @@ mod ticket_tests {
+         assert!(!wants_ticket([8, 4, 1], 32));
+         assert!(!wants_ticket([8, 8, 1], 64));
+     }
++
++    #[test]
++    fn a_group_whose_shared_memory_is_full_takes_no_ticket() {
++        assert!(super::lds_has_room(0));
++        assert!(super::lds_has_room(8191));
++        assert!(!super::lds_has_room(8192));
++        assert!(!super::lds_has_room(8225));
++    }
+ }
+ 
+ #[cfg(test)]
+-- 
+2.56.0.windows.3
+

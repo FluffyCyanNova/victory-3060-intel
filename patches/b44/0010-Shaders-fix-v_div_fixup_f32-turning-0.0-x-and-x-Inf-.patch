@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 00:28:45 +0100
+Subject: [PATCH 10/43] Shaders: fix v_div_fixup_f32 turning 0.0/x and x/Inf
+ into +/-Infinity
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In `Lower::valu` for `v_div_fixup_f32`, `q_nan` was ORed into `make_inf`
+and applied after `make_zero`. Because `v_div_scale_f32` outputs `qNaN`
+whenever either operand is zero (`0.0 / x`), and `v_fma_f32(-Inf, 0, 1)`
+produces `qNaN` when the denominator is infinite (`x / +/-Inf`), both
+`make_zero` and `q_nan` are true for those cases — causing `make_inf` to
+overwrite `+/-0.0` with `+/-Infinity`.
+
+Match the RDNA2/GFX10 `V_DIV_FIXUP_F32` priority order: apply
+`q_nan -> signed_inf` below `make_zero` (`d_inf || n_zero`) so `0.0 / x`
+and `x / +/-Inf` evaluate to signed zero while finite quotient overflow
+(`q_nan` with finite non-zero inputs) still produces signed infinity.
+
+Extend `valu_div_f32_sequence_executes_on_gpu` to test `0/1`, `-0/1`,
+`0/-2`, `1/+Inf`, `-1/+Inf`, `+Inf/+Inf`, and `+/-1e38 / 1e-38` on both
+hardware D3D12 and WARP.
+
+(cherry picked from commit 84d0e6aead7660d963d1d39a5864823ec88daaaf)
+(cherry picked from commit 441d3bb5c30ef5582b25f7f994ba7c7910d4fda1)
+---
+ crates/victory-shader/src/emit/lower.rs | 13 +++--
+ crates/victory-shader/src/emit/mod.rs   | 72 +++++++++++++++++++------
+ 2 files changed, 64 insertions(+), 21 deletions(-)
+
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 89d35964e..253ce2cd9 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -7207,16 +7207,19 @@ impl<'a> Lower<'a> {
+                 let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
+                 let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
+                 let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
+-                let make_inf = {
+-                    let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
+-                    self.s.m.bin(c, Bin::Or, t, q_nan)
+-                };
++                let make_inf = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
+                 let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
+                 let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
+                 let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
+                 let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
+                 let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
+-                let r = self.s.m.select(c, make_zero, sign, signed_q);
++                // Priority (highest to lowest): n_nan, d_nan, invalid (0/0 or
++                // Inf/Inf), make_inf (n_inf or d_zero), make_zero (d_inf or
++                // n_zero), q_nan (overflowed quotient -> signed Inf), signed_q.
++                // `q_nan` must stay below `make_zero` because `v_div_scale_f32`
++                // and `v_fma_f32(-Inf, 0, 1)` produce qNaN on `0 / x` and `x / Inf`.
++                let r = self.s.m.select(c, q_nan, signed_inf, signed_q);
++                let r = self.s.m.select(c, make_zero, sign, r);
+                 let r = self.s.m.select(c, make_inf, signed_inf, r);
+                 let r = self.s.m.select(c, invalid, kneg_qnan, r);
+                 let r = self.s.m.select(c, d_nan, d_qnan, r);
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 879a8b6a7..ab488a23c 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -1341,7 +1341,7 @@ mod tests {
+             ],
+             io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                 rsrc2: 5 << 1,
+-                threads: [7, 1, 1],
++                threads: [15, 1, 1],
+             }),
+             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+         };
+@@ -1369,21 +1369,53 @@ mod tests {
+             v.validate(&mut dxil).unwrap();
+         }
+         #[cfg(windows)]
+-        if let Ok(host) = super::host::Host::new(false) {
++        for warp in [false, true] {
++            let Ok(host) = super::host::Host::new(warp) else {
++                continue;
++            };
+             let cs = super::HostShader {
+                 stage: super::HwStage::Cs,
+-                dxil,
+-                user_data: l.user_data,
++                dxil: dxil.clone(),
++                user_data: l.user_data.clone(),
+                 samplers: Vec::new(),
+                 static_samplers: Vec::new(),
+-                root_cbvs: l.root_cbvs,
+-                root_srvs: l.root_srvs,
+-                root_uavs: l.root_uavs,
++                root_cbvs: l.root_cbvs.clone(),
++                root_srvs: l.root_srvs.clone(),
++                root_uavs: l.root_uavs.clone(),
+                 root_indexed_views: Vec::new(),
+             };
+             let (root, pso) = host.compute_pipeline(&cs).unwrap();
+             let inputs: Vec<u32> = [
+-                7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0, -1e35, 1e35,
++                7.0f32,
++                3.0,
++                -1.0,
++                1e-40,
++                1.0,
++                1e35,
++                1e-35,
++                1e-36,
++                0.0,
++                0.0,
++                -1.0,
++                0.0,
++                -1e35,
++                1e35,
++                0.0,
++                1.0,
++                -0.0,
++                1.0,
++                0.0,
++                -2.0,
++                1.0,
++                f32::INFINITY,
++                -1.0,
++                f32::INFINITY,
++                f32::INFINITY,
++                f32::INFINITY,
++                1e38,
++                1e-38,
++                -1e38,
++                1e-38,
+             ]
+             .into_iter()
+             .map(f32::to_bits)
+@@ -1406,29 +1438,37 @@ mod tests {
+                     },
+                 )
+                 .unwrap();
+-            let got: Vec<f32> = out[0][..7].iter().copied().map(f32::from_bits).collect();
+-            assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "got {:?}", got);
+-            assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits());
++            let got: Vec<f32> = out[0][..15].iter().copied().map(f32::from_bits).collect();
++            assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "warp={warp} got {:?}", got);
++            assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits(), "warp={warp}");
+             assert!(
+                 (got[2] - 1e-35).abs() <= 1e-40,
+-                "lane 2 got {:?} ({:#x})",
++                "warp={warp} lane 2 got {:?} ({:#x})",
+                 got[2],
+                 out[0][2]
+             );
+             assert!(
+                 (got[3] - 10.0).abs() < 1e-5,
+-                "lane 3 got {:?} ({:#x})",
++                "warp={warp} lane 3 got {:?} ({:#x})",
+                 got[3],
+                 out[0][3]
+             );
+-            assert_eq!(out[0][4], 0xFFC0_0000);
+-            assert_eq!(out[0][5], (-1.0f32 / 0.0).to_bits());
++            assert_eq!(out[0][4], 0xFFC0_0000, "warp={warp} 0/0");
++            assert_eq!(out[0][5], (-1.0f32 / 0.0).to_bits(), "warp={warp} -1/0");
+             assert!(
+                 (got[6] - (-1.0)).abs() < 1e-6,
+-                "lane 6 got {:?} ({:#x})",
++                "warp={warp} lane 6 got {:?} ({:#x})",
+                 got[6],
+                 out[0][6]
+             );
++            assert_eq!(out[0][7], 0.0f32.to_bits(), "warp={warp} +0/1");
++            assert_eq!(out[0][8], (-0.0f32).to_bits(), "warp={warp} -0/1");
++            assert_eq!(out[0][9], (-0.0f32).to_bits(), "warp={warp} +0/-2");
++            assert_eq!(out[0][10], 0.0f32.to_bits(), "warp={warp} 1/+Inf");
++            assert_eq!(out[0][11], (-0.0f32).to_bits(), "warp={warp} -1/+Inf");
++            assert_eq!(out[0][12], 0xFFC0_0000, "warp={warp} +Inf/+Inf");
++            assert_eq!(out[0][13], f32::INFINITY.to_bits(), "warp={warp} 1e38/1e-38");
++            assert_eq!(out[0][14], f32::NEG_INFINITY.to_bits(), "warp={warp} -1e38/1e-38");
+         }
+     }
+ }

@@ -1,0 +1,222 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Sat, 28 Nov 2026 04:36:37 +0800
+Subject: [PATCH] GPU: buffer views off 16 bytes as structured views of 4-byte
+ elements (VICTORY_DWORD_VIEWS=1)
+
+Translated shaders read every untyped buffer as raw bytes. A raw view
+starts on 16 bytes; the console's views start on any dword. A raw view off
+16 was refused and left null, and a structured view off 16 was made as a
+structured view of the title's stride: about 550 a frame (run 69).
+
+Measured on a GeForce RTX 3060 (the probes in the shader crate's tests, on
+the branch b71-probes): through a structured view of stride 8, 12 or 16 a
+raw read at byte b lands at (b / 4) x stride, so such a view gave other
+data or, past its end, zeros. Through a structured view of stride 4, reads
+and stores land where a raw view's do, from any dword.
+
+With VICTORY_DWORD_VIEWS=1 (off by default) those two kinds of view are
+made as structured views of 4-byte elements of the same bytes: no copy,
+and nothing changes in the shaders. The line that counts refused views
+counts them too.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/descriptor/host.rs | 136 ++++++++++++++++++++--
+ 1 file changed, 128 insertions(+), 8 deletions(-)
+
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 8fe0f128e..6b4bf9ccf 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -836,7 +836,8 @@ pub(crate) fn refused_line() {
+     use std::sync::atomic::Ordering::Relaxed;
+     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+     let left = STRUCTURED_LEFT.load(Relaxed);
+-    let total = REFUSED_VIEWS.load(Relaxed) + left;
++    let dwords = DWORD_VIEWS.load(Relaxed);
++    let total = REFUSED_VIEWS.load(Relaxed) + left + dwords;
+     if LAST.swap(total, Relaxed) == total {
+         return;
+     }
+@@ -849,7 +850,7 @@ pub(crate) fn refused_line() {
+         })
+         .collect();
+     tracing::info!(
+-        "buffer views left null so far, by kind: {}; structured views not on 16 bytes of their host copy, made as structured views so far (a raw read through one may give zeros): {left}",
++        "buffer views left null so far, by kind: {}; structured views not on 16 bytes of their host copy, made as structured views so far (a raw read through one may give zeros): {left}; views off 16 bytes made as structured views of 4-byte elements so far (VICTORY_DWORD_VIEWS): {dwords}",
+         if kinds.is_empty() { "none".to_owned() } else { kinds.join("; ") }
+     );
+ }
+@@ -2517,6 +2518,59 @@ fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool, bool)> {
+     }
+ }
+ 
++/// Whether the buffer views the host cannot take as raw views because
++/// their bytes do not start on 16 are made as structured views of 4-byte
++/// elements (`VICTORY_DWORD_VIEWS=1`; off by default).
++///
++/// Translated shaders read every untyped buffer as raw bytes. A raw view
++/// starts on 16 bytes; the console's views start on any dword. Two kinds
++/// of view are off 16: a raw one (refused and left null, or given a copy
++/// of its own bytes with `VICTORY_RAW_OWN_COPY`), and a structured one,
++/// which was made as a structured view of the title's stride (about 550 a
++/// frame in run 69). Measured on a GeForce RTX 3060 (probes of 2026-11-28
++/// in the shader crate's tests): through a structured view of stride 8, 12
++/// or 16 a raw read at byte b lands at (b / 4) x stride, not at b, so such
++/// a view read other data or, past its end, zeros. Through a structured
++/// view of stride 4 reads and stores land where a raw view's do, from any
++/// dword, and such a view has no 16-byte rule: its first element counts
++/// dwords. So those two kinds become structured views of stride 4 of the
++/// same bytes: no copy, and nothing the shader does changes.
++/// shortcut: measured on one card and on WARP; another vendor's driver may
++/// read a raw access through a structured view another way.
++fn dword_views() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_DWORD_VIEWS").is_some_and(|v| v == "1"))
++}
++
++/// Buffer views made as structured views of 4-byte elements
++/// ([`dword_views`]) since the start.
++static DWORD_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++/// With [`dword_views`] (`on`): the first element and the elements of the
++/// structured view of 4-byte elements that takes the place of the view the
++/// host would get (`format`, `first`, `count`, `stride`, `raw`: its fields
++/// on the host copy, the copy's offset already in `first`). `None`: the
++/// view is made as it is. A raw view counts dwords already, and is one of
++/// these when it is not on 16 bytes; a structured view is one when its
++/// stride is not 4 (it is only still structured because [`raw_window`]
++/// could not make it raw) and its bytes are whole dwords from a dword.
++fn dword_view_if(on: bool, format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bool) -> Option<(u64, u32)> {
++    if !on || count == 0 {
++        return None;
++    }
++    if raw {
++        return (format == DXGI_FORMAT_R32_TYPELESS && stride == 0 && !first.is_multiple_of(4)).then_some((first, count));
++    }
++    if format != DXGI_FORMAT_UNKNOWN || stride == 0 || stride == 4 {
++        return None;
++    }
++    let start = first.checked_mul(u64::from(stride))?;
++    let bytes = u64::from(count).checked_mul(u64::from(stride))?;
++    (start.is_multiple_of(4) && bytes.is_multiple_of(4))
++        .then(|| u32::try_from(bytes / 4).ok().map(|dwords| (start / 4, dwords)))
++        .flatten()
++}
++
+ /// A structured buffer view (`first`, `count` elements of `stride` bytes,
+ /// `offset` bytes into its host copy) as a raw view of the same bytes:
+ /// its first dword and its dwords. Translated shaders read untyped buffers
+@@ -2659,12 +2713,29 @@ fn buffer_srv(
+             return None;
+         }
+         buffer.FirstElement += offset / element;
+-        if desc.Format == DXGI_FORMAT_UNKNOWN && buffer.StructureByteStride > 0 {
+-            STRUCTURED_LEFT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+-        }
+     }
+     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
+     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
++    // Off 16 bytes: as a structured view of 4-byte elements (`dword_views`).
++    let (first, count, stride, raw) = match dword_view_if(dword_views(), desc.Format, first, count, stride, raw) {
++        Some((first, count)) => {
++            desc.Format = DXGI_FORMAT_UNKNOWN;
++            *buffer = D3D12_BUFFER_SRV {
++                FirstElement: first,
++                NumElements: count,
++                StructureByteStride: 4,
++                Flags: D3D12_BUFFER_SRV_FLAG_NONE,
++            };
++            DWORD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            (first, count, 4, false)
++        }
++        None => {
++            if window.is_none() && desc.Format == DXGI_FORMAT_UNKNOWN && stride > 0 {
++                STRUCTURED_LEFT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            }
++            (first, count, stride, raw)
++        }
++    };
+     // SAFETY: a live buffer.
+     let width = unsafe { shadow.buffer.GetDesc() }.Width;
+     if let Some(kind) = buffer_view_refusal(desc.Format, first, count, stride, raw, width) {
+@@ -2767,9 +2838,6 @@ fn buffer_uav(
+             return None;
+         }
+         buffer.FirstElement += offset / element;
+-        if desc.Format == DXGI_FORMAT_UNKNOWN && buffer.StructureByteStride > 0 {
+-            STRUCTURED_LEFT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+-        }
+     }
+     buffer.CounterOffsetInBytes = 0;
+     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
+@@ -2780,6 +2848,26 @@ fn buffer_uav(
+         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
+         desc.Format = DXGI_FORMAT_R32_TYPELESS;
+     }
++    // Off 16 bytes: as a structured view of 4-byte elements (`dword_views`).
++    let (first, count, stride, raw) = match dword_view_if(dword_views(), desc.Format, first, count, stride, raw) {
++        Some((first, count)) => {
++            desc.Format = DXGI_FORMAT_UNKNOWN;
++            // SAFETY: a buffer view's union member.
++            let buffer = unsafe { &mut desc.Anonymous.Buffer };
++            buffer.FirstElement = first;
++            buffer.NumElements = count;
++            buffer.StructureByteStride = 4;
++            buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
++            DWORD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            (first, count, 4, false)
++        }
++        None => {
++            if window.is_none() && desc.Format == DXGI_FORMAT_UNKNOWN && stride > 0 {
++                STRUCTURED_LEFT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            }
++            (first, count, stride, raw)
++        }
++    };
+     // SAFETY: a live buffer.
+     let width = unsafe { shadow.buffer.GetDesc() }.Width;
+     if let Some(kind) = buffer_view_refusal(desc.Format, first, count, stride, raw, width) {
+@@ -3477,6 +3565,38 @@ mod tests {
+         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+     }
+ 
++    /// `VICTORY_DWORD_VIEWS=1`: a raw view off 16 bytes and a structured view
++    /// that could not be made raw become structured views of 4-byte
++    /// elements of the same bytes, which the host takes from any dword.
++    #[test]
++    fn views_off_16_bytes_become_views_of_four_byte_elements() {
++        let raw = DXGI_FORMAT_R32_TYPELESS;
++        let none = DXGI_FORMAT_UNKNOWN;
++        // the raw view of the runs' log: 72 dwords from dword 2 (refused as a raw view)
++        assert_eq!(buffer_view_refusal(raw, 2, 72, 0, true, 4_194_304), Some(0));
++        assert_eq!(dword_view_if(true, raw, 2, 72, 0, true), Some((2, 72)));
++        assert_eq!(buffer_view_refusal(none, 2, 72, 4, false, 4_194_304), None);
++        // a raw view on 16 bytes stays raw
++        assert_eq!(dword_view_if(true, raw, 4, 72, 0, true), None);
++        assert_eq!(dword_view_if(true, raw, 0, 72, 0, true), None);
++        // a structured view of 12-byte elements from element 1 (12 bytes in):
++        // the same bytes as dwords 3..33
++        assert!(raw_window(0, 1, 10, 12).is_none());
++        assert_eq!(dword_view_if(true, none, 1, 10, 12, false), Some((3, 30)));
++        assert_eq!(buffer_view_refusal(none, 3, 30, 4, false, 4096), None);
++        // 20-byte elements from element 3: dwords 15..65
++        assert_eq!(dword_view_if(true, none, 3, 10, 20, false), Some((15, 50)));
++        // one of 4-byte elements is read right as it is; a typed view and a
++        // stride that is not whole dwords are not ours; no elements: none
++        assert_eq!(dword_view_if(true, none, 3, 10, 4, false), None);
++        assert_eq!(dword_view_if(true, DXGI_FORMAT_R32_FLOAT, 3, 10, 0, false), None);
++        assert_eq!(dword_view_if(true, none, 1, 10, 6, false), None);
++        assert_eq!(dword_view_if(true, raw, 2, 0, 0, true), None);
++        // the switch off: as before
++        assert_eq!(dword_view_if(false, raw, 2, 72, 0, true), None);
++        assert_eq!(dword_view_if(false, none, 1, 10, 12, false), None);
++    }
++
+     /// A refused buffer view names its reason, and the view a raw view off
+     /// 16 bytes becomes on a copy of its own bytes is taken.
+     #[test]
+-- 
+2.56.0.windows.3
+

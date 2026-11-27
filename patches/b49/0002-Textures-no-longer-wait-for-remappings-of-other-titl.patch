@@ -1,0 +1,487 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Tue, 24 Nov 2026 22:22:33 +0100
+Subject: [PATCH 2/3] Textures no longer wait for remappings of other title
+ memory
+
+Reads of title memory in place (texture refreshes at submission, rectangle
+vertices) and the runtime's changes of its mapping (XMemMapPhysicalPages,
+its scatter form, map_alias) shared one lock over all of title memory.
+While the world streams in the title changes mappings 650-1,100 times a
+frame, many a page at a time, so every refresh waited for changes anywhere
+and every change for the refresh under way.
+
+Now a read holds the bytes it reads and a change the bytes whose mapping it
+changes (the range, and the whole of the views unmap takes away and maps
+again); they wait for each other only where those meet. A change waiting
+for a read keeps new reads of its bytes out, as the lock's writers did.
+VICTORY_MAPPING_RANGES=0 holds all of title memory, as before. A new frame
+line gives the changes per frame, the time they waited for reads in place
+and the time they were under way.
+
+Paired runs on one exe (1684989 + this change) with a warm shader cache,
+RTX 5070 Ti, 8 min each, medians over the world; A with
+VICTORY_MAPPING_RANGES=0, B without:
+- frame 801 -> 486 ms (mean 1,099 -> 524, p90 2,199 -> 670)
+- textures 371 -> 47 ms, of them waiting for title memory to hold still
+  203 -> 0 ms (mean 389 -> 0.6)
+- texture bytes read 233 -> 288 MB/s: nothing is left out
+- the runtime's changes waiting for reads 37 -> 0 ms a frame
+- GPU 150 -> 135 ms, copies 44 -> 45, copy back 79 -> 72; drops 375 -> 363
+- no device removal in either; slow submissions 4 and 5
+- frames: the same lit opening scenes, B further into them in the time
+For comparison, VICTORY_TEXTURE_NO_WAIT=1 on 1684989 (pair 768 -> 530 ms)
+reads 91 MB/s against 228 and leaves ~61 refreshes a frame for later.
+
+Tests: victory-gpu (new: reads and changes of other bytes go on, and a
+change that waits keeps new reads of its bytes out), victory-hle (the
+read-in-place stress test of xmem), the workspace; clippy in both CI
+configurations. Rebased onto 4e17478 without conflicts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit b18da0e6f8892900749cbd214c601d29b2bb998a)
+---
+ crates/victory-gpu/src/draw.rs         |   2 +-
+ crates/victory-gpu/src/host.rs         |  10 +
+ crates/victory-gpu/src/texture.rs      |   4 +-
+ crates/victory-gpu/src/watch.rs        | 257 ++++++++++++++++++++++---
+ crates/victory-hle/src/modules/xmem.rs |  34 +++-
+ 5 files changed, 272 insertions(+), 35 deletions(-)
+
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 05d124c81..d80adad8f 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -2972,7 +2972,7 @@ impl State {
+                 // The vertices are read in place, at submission: no change
+                 // of mapping under the read (see
+                 // `crate::watch::title_memory_reading`).
+-                let _mapped = crate::watch::title_memory_reading();
++                let _mapped = crate::watch::title_memory_reading(from, n * 3 * stride);
+                 // SAFETY: the vertices lie in a title buffer (checked when
+                 // recorded) and the scratch memory is the list's.
+                 let (src, dst) = unsafe {
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index afd625b72..4233c0ba6 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -6464,6 +6464,16 @@ impl Meter {
+                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
+                 );
+             }
++            let [changes, waiting, under_way] = [0, 1, 2].map(|i| {
++                crate::watch::REMAPS[i].swap(0, Ordering::Relaxed) as f64 / [1.0, 1e3, 1e3][i] / frames
++            });
++            if changes > 0.0 {
++                tracing::info!(
++                    "changes of title memory's mapping per frame: {changes:.0}, {waiting:.1} ms of them waiting for reads in place, \
++                     {under_way:.1} ms under way (each holds {}; VICTORY_MAPPING_RANGES=0 holds all of title memory)",
++                    if crate::watch::by_range() { "the bytes it changes" } else { "all of title memory" }
++                );
++            }
+         }
+         {
+             let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+index f3dd6f2ea..309418ab1 100644
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -979,12 +979,12 @@ impl Staging {
+             // Not waited for: while the runtime remaps title memory the
+             // texture is read through the kernel instead, whole or not at
+             // all (`no_wait`).
+-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
++            let Some(mapped) = crate::watch::title_memory_reading_now(start, size) else {
+                 return self.refresh_unlocked(last, size);
+             };
+             mapped
+         } else {
+-            waited(2, crate::watch::title_memory_reading)
++            waited(2, || crate::watch::title_memory_reading(start, size))
+         };
+         if !committed(self.memory, size) {
+             // Partly mapped: a streamed texture with only some mips' pages
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index 176379549..39e4de8e7 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -921,40 +921,191 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
+ /// had asked whether the texture was all mapped and been told yes. Asking
+ /// cannot help; not changing the mapping while such a read is under way
+ /// does.
++///
++/// Only with `VICTORY_MAPPING_RANGES=0` ([`by_range`]); otherwise reads and
++/// changes hold the bytes they touch ([`SPANS`]).
+ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+ 
++/// Whether a read in place and a change of mapping keep apart only when
++/// their bytes meet ([`SPANS`]), not whatever memory each touches
++/// ([`MAPPING`]); `VICTORY_MAPPING_RANGES=0` holds all of title memory for
++/// each, as before. On by default.
++///
++/// With one lock over all of title memory each texture refresh waited for
++/// every change of mapping anywhere, and each change for the refresh under
++/// way. While the world streams in the title changes mappings 650-1,100
++/// times a frame, many a page at a time (`XMemMapPhysicalPagesScatter`
++/// maps each page on its own). With the one lock the refreshes waited 203
++/// ms of an 801 ms frame for title memory to hold still; holding only the
++/// bytes touched, 0 ms of a 486 ms frame (medians, a pair of runs).
++pub(crate) fn by_range() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPING_RANGES").is_none_or(|v| v != "0"))
++}
++
++/// Reads of title memory in place under way, and changes of its mapping,
++/// by the bytes they touch ([`by_range`]).
++struct Spans {
++    /// To tell them apart.
++    next: u64,
++    /// Reads under way: number, start and end.
++    reads: Vec<(u64, usize, usize)>,
++    /// Changes: number, start, end, and whether under way (else waiting for
++    /// the reads over its bytes to end; no read begins over them meanwhile,
++    /// so that one read after another cannot keep a change waiting).
++    changes: Vec<(u64, usize, usize, bool)>,
++    /// Threads waiting on [`SPANS_LEFT`].
++    waiting: usize,
++}
++
++static SPANS: Mutex<Spans> = Mutex::new(Spans {
++    next: 0,
++    reads: Vec::new(),
++    changes: Vec::new(),
++    waiting: 0,
++});
++
++/// Told when a read or a change ends while a thread waits.
++static SPANS_LEFT: std::sync::Condvar = std::sync::Condvar::new();
++
++fn spans() -> std::sync::MutexGuard<'static, Spans> {
++    SPANS.lock().unwrap_or_else(|e| e.into_inner())
++}
++
++/// Waits until a read or a change ends.
++fn spans_wait(mut s: std::sync::MutexGuard<'static, Spans>) -> std::sync::MutexGuard<'static, Spans> {
++    s.waiting += 1;
++    let mut s = SPANS_LEFT.wait(s).unwrap_or_else(|e| e.into_inner());
++    s.waiting -= 1;
++    s
++}
++
++/// Whether `[a, b)` and `[c, d)` share a byte.
++fn meet(a: usize, b: usize, c: usize, d: usize) -> bool {
++    a < d && c < b
++}
++
++impl Spans {
++    fn read(&mut self, at: usize, end: usize) -> Span {
++        self.next += 1;
++        self.reads.push((self.next, at, end));
++        Span(self.next, false)
++    }
++}
++
++/// A read's or a change's place in [`SPANS`] (its number, and whether a
++/// change), given up when dropped.
++struct Span(u64, bool);
++
++impl Drop for Span {
++    fn drop(&mut self) {
++        let mut s = spans();
++        if self.1 {
++            s.changes.retain(|c| c.0 != self.0);
++        } else if let Some(i) = s.reads.iter().position(|r| r.0 == self.0) {
++            s.reads.swap_remove(i);
++        }
++        if s.waiting > 0 {
++            SPANS_LEFT.notify_all();
++        }
++    }
++}
++
++/// What a read or a change of mapping holds: its bytes ([`by_range`]) or
++/// the lock over all of title memory.
++enum Held<G> {
++    All(#[allow(dead_code)] G),
++    Bytes(#[allow(dead_code)] Span),
++}
++
++/// Since the last frame-rate line: changes of title memory's mapping, the
++/// microseconds they waited for reads in place, and those they were under
++/// way.
++pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
++
+ /// What the runtime holds while it changes what title memory shows
+ /// ([`title_memory_remapping`]).
+-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
++pub struct Remapping {
++    _held: Held<std::sync::RwLockWriteGuard<'static, ()>>,
++    since: std::time::Instant,
++}
++
++impl Drop for Remapping {
++    fn drop(&mut self) {
++        REMAPS[2].fetch_add(self.since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
++    }
++}
+ 
+ /// The runtime is about to map, unmap or move physical pages of title
+-/// memory: until what it returns is dropped, no read of title memory in
+-/// place is under way and none begins ([`title_memory_reading`]). Taken
+-/// around the whole change, the unmapping and the mapping again.
+-pub fn title_memory_remapping() -> Remapping {
+-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
++/// memory `[at, at + len)`: until what it returns is dropped, no read of
++/// those bytes in place is under way and none begins
++/// ([`title_memory_reading`]). Taken around the whole change, the unmapping
++/// and the mapping again, over all the bytes whose mapping it changes.
++pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
++    use std::sync::atomic::Ordering::Relaxed;
++    let started = std::time::Instant::now();
++    let held = if by_range() {
++        let end = at.saturating_add(len);
++        let mut s = spans();
++        s.next += 1;
++        let id = s.next;
++        s.changes.push((id, at, end, false));
++        while s.reads.iter().any(|r| meet(r.1, r.2, at, end))
++            || s.changes.iter().any(|c| c.3 && meet(c.1, c.2, at, end))
++        {
++            s = spans_wait(s);
++        }
++        if let Some(c) = s.changes.iter_mut().find(|c| c.0 == id) {
++            c.3 = true;
++        }
++        Held::Bytes(Span(id, true))
++    } else {
++        Held::All(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
++    };
++    REMAPS[0].fetch_add(1, Relaxed);
++    REMAPS[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
++    Remapping {
++        _held: held,
++        since: std::time::Instant::now(),
++    }
+ }
+ 
+ /// What a read of title memory in place holds ([`title_memory_reading`]).
+-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+-
+-/// For reading title memory in place: until what it returns is dropped,
+-/// the runtime changes no mapping, so memory found mapped stays mapped.
+-/// Not to be taken twice by one thread, nor held across anything that
+-/// maps title memory.
+-pub fn title_memory_reading() -> Reading {
+-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
++pub struct Reading(#[allow(dead_code)] Held<std::sync::RwLockReadGuard<'static, ()>>);
++
++/// For reading title memory `[at, at + len)` in place: until what it
++/// returns is dropped, the runtime changes no mapping of those bytes, so
++/// memory found mapped stays mapped. Not to be taken twice by one thread,
++/// nor held across anything that maps title memory.
++pub fn title_memory_reading(at: usize, len: usize) -> Reading {
++    if !by_range() {
++        return Reading(Held::All(MAPPING.read().unwrap_or_else(|e| e.into_inner())));
++    }
++    let end = at.saturating_add(len);
++    let mut s = spans();
++    while s.changes.iter().any(|c| meet(c.1, c.2, at, end)) {
++        s = spans_wait(s);
++    }
++    Reading(Held::Bytes(s.read(at, end)))
+ }
+ 
+ /// [`title_memory_reading`] if it can be had at once: `None` while the
+-/// runtime changes a mapping (or waits to), for a caller that has another
+-/// way to read and would rather not wait.
+-pub fn title_memory_reading_now() -> Option<Reading> {
+-    match MAPPING.try_read() {
+-        Ok(guard) => Some(Reading(guard)),
+-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
+-        Err(std::sync::TryLockError::WouldBlock) => None,
++/// runtime changes a mapping of those bytes (or waits to), for a caller
++/// that has another way to read and would rather not wait.
++pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
++    if !by_range() {
++        return match MAPPING.try_read() {
++            Ok(guard) => Some(Reading(Held::All(guard))),
++            Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(Held::All(e.into_inner()))),
++            Err(std::sync::TryLockError::WouldBlock) => None,
++        };
++    }
++    let end = at.saturating_add(len);
++    let mut s = spans();
++    if s.changes.iter().any(|c| meet(c.1, c.2, at, end)) {
++        return None;
+     }
++    Some(Reading(Held::Bytes(s.read(at, end))))
+ }
+ 
+ /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
+@@ -1533,24 +1684,27 @@ mod tests {
+ 
+ #[cfg(test)]
+ mod mapping_tests {
+-    use super::{title_memory_reading, title_memory_remapping};
++    use super::{PAGE, by_range, title_memory_reading, title_memory_remapping};
+     use std::sync::atomic::{AtomicBool, Ordering};
+     use std::sync::{Arc, mpsc};
+     use std::time::Duration;
+ 
+-    /// A change of mapping waits for a read in place that is under way, and
+-    /// a read in place waits for a change of mapping.
++    /// Addresses only these tests hold (nothing is read there).
++    const HERE: usize = 0x7e00_0000_0000;
++
++    /// A change of mapping waits for a read in place of its bytes that is
++    /// under way, and such a read waits for the change.
+     #[test]
+     fn reads_in_place_and_remappings_wait_for_each_other() {
+         // A reader holds; the change does not begin until it lets go.
+         let changed = Arc::new(AtomicBool::new(false));
+-        let reading = title_memory_reading();
++        let reading = title_memory_reading(HERE + PAGE / 2, PAGE);
+         let (began, wait) = mpsc::channel();
+         let change = {
+             let changed = changed.clone();
+             std::thread::spawn(move || {
+                 began.send(()).unwrap();
+-                let _changing = title_memory_remapping();
++                let _changing = title_memory_remapping(HERE + PAGE, PAGE);
+                 changed.store(true, Ordering::SeqCst);
+             })
+         };
+@@ -1562,13 +1716,13 @@ mod mapping_tests {
+         assert!(changed.load(Ordering::SeqCst));
+         // A change holds; the read does not begin until it is done.
+         let read = Arc::new(AtomicBool::new(false));
+-        let changing = title_memory_remapping();
++        let changing = title_memory_remapping(HERE, 2 * PAGE);
+         let (began, wait) = mpsc::channel();
+         let reader = {
+             let read = read.clone();
+             std::thread::spawn(move || {
+                 began.send(()).unwrap();
+-                let _reading = title_memory_reading();
++                let _reading = title_memory_reading(HERE + PAGE + 16, 16);
+                 read.store(true, Ordering::SeqCst);
+             })
+         };
+@@ -1579,4 +1733,51 @@ mod mapping_tests {
+         reader.join().unwrap();
+         assert!(read.load(Ordering::SeqCst));
+     }
++
++    /// Reads and changes whose bytes do not meet do not wait for each other,
++    /// and a change waiting for a read keeps new reads of its bytes out (but
++    /// not of others).
++    #[test]
++    fn reads_and_remappings_of_other_bytes_go_on() {
++        if !by_range() {
++            return; // VICTORY_MAPPING_RANGES=0: one lock over all of it
++        }
++        let at = HERE + 16 * PAGE;
++        let reading = title_memory_reading(at, PAGE);
++        // Another page changes while the read is under way, and another
++        // read goes on while that change is.
++        let (done, finished) = mpsc::channel();
++        std::thread::spawn(move || {
++            let changing = title_memory_remapping(at + PAGE, PAGE);
++            let (read, was_read) = mpsc::channel();
++            std::thread::spawn(move || {
++                let _reading = title_memory_reading(at + 2 * PAGE, PAGE);
++                read.send(()).unwrap();
++            });
++            let other = was_read.recv_timeout(Duration::from_secs(10)).is_ok();
++            drop(changing);
++            done.send(other).unwrap();
++        });
++        assert_eq!(finished.recv_timeout(Duration::from_secs(10)), Ok(true), "kept apart though their bytes do not meet");
++        // A change of the read's page waits, and keeps a new read of its
++        // bytes out meanwhile; a read elsewhere is not kept out.
++        let changed = Arc::new(AtomicBool::new(false));
++        let change = {
++            let changed = changed.clone();
++            std::thread::spawn(move || {
++                let _changing = title_memory_remapping(at, PAGE);
++                changed.store(true, Ordering::SeqCst);
++            })
++        };
++        while !super::spans().changes.iter().any(|c| c.1 == at) {
++            std::thread::yield_now();
++        }
++        assert!(super::title_memory_reading_now(at + 8, 8).is_none(), "a read began over a change that waits");
++        assert!(super::title_memory_reading_now(at + 3 * PAGE, 8).is_some());
++        std::thread::sleep(Duration::from_millis(50));
++        assert!(!changed.load(Ordering::SeqCst), "the mapping changed under a read in place");
++        drop(reading);
++        change.join().unwrap();
++        assert!(changed.load(Ordering::SeqCst));
++    }
+ }
+diff --git a/crates/victory-hle/src/modules/xmem.rs b/crates/victory-hle/src/modules/xmem.rs
+index 74adc84fa..10549b4ca 100644
+--- a/crates/victory-hle/src/modules/xmem.rs
++++ b/crates/victory-hle/src/modules/xmem.rs
+@@ -702,8 +702,10 @@ pub extern "system" fn XMemMapPhysicalPages(
+     // Until the pages are mapped again: `unmap` takes whole views away and
+     // maps what stays of them again, and a mapped view is a reservation
+     // until it is committed. A read of title memory in place must not fall
+-    // into that gap (`victory_gpu::title_memory_remapping`).
+-    let _changing = victory_gpu::title_memory_remapping();
++    // into that gap (`victory_gpu::title_memory_remapping`); reads of other
++    // bytes go on.
++    let (from, to) = reach(&physical, base, n * PAGE);
++    let _changing = victory_gpu::title_memory_remapping(from, to - from);
+     unmap(&mut physical, base, n * PAGE);
+     if pages.is_null() {
+         return address;
+@@ -772,7 +774,8 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+     let (to, from, len) = (to as usize, from as usize, len as usize);
+     let mut physical = physical();
+     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
+-    let _changing = victory_gpu::title_memory_remapping();
++    let (start, end) = reach(&physical, to, len);
++    let _changing = victory_gpu::title_memory_remapping(start, end - start);
+     unmap(&mut physical, to, len);
+     for k in (0..len).step_by(PAGE) {
+         if from == 0 {
+@@ -895,6 +898,29 @@ fn commit_limit_message(
+     message
+ }
+ 
++/// Start and end of the bytes whose mapping `unmap(physical, base, len)`
++/// and mapping `[base, base + len)` again change: the range, and the whole
++/// of the views reaching out of it (`unmap` takes them away and maps what
++/// stays of them again).
++fn reach(physical: &Physical, base: usize, len: usize) -> (usize, usize) {
++    let end = base.saturating_add(len);
++    if len == 0 {
++        return (base, end); // `unmap` changes nothing
++    }
++    let mut reach = (base, end);
++    // As `unmap` finds them: the view holding `base`, the last starting
++    // inside (views do not overlap).
++    if let Some((&at, &(size, _))) = physical.views.range(..=base).next_back()
++        && at + size > base
++    {
++        reach = (at, end.max(at + size));
++    }
++    if let Some((&at, &(size, _))) = physical.views.range(base + 1..end).next_back() {
++        reach.1 = reach.1.max(at + size);
++    }
++    reach
++}
++
+ /// Returns `[base, base + len)` to placeholders; views reaching past it
+ /// are mapped again outside it.
+ fn unmap(physical: &mut Physical, base: usize, len: usize) {
+@@ -1285,7 +1311,7 @@ mod tests {
+             std::thread::spawn(move || {
+                 let mut reads = 0u64;
+                 while !stop.load(Ordering::Relaxed) {
+-                    let _reading = victory_gpu::title_memory_reading();
++                    let _reading = victory_gpu::title_memory_reading(first, 1);
+                     // SAFETY: the page is mapped whenever no change of
+                     // mapping is under way, and none is while `_reading`
+                     // is held.

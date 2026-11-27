@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Fri, 27 Nov 2026 23:06:27 +0800
+Subject: [PATCH 02/13] translate: VICTORY_DXIL_SUMS=<file> lists each emitted
+ program's DXIL hash
+
+Off when unset. One line per emitted program, appended: the BLAKE3 hash
+of its DXIL, the DXIL's length, the program's label. Two builds of the
+translator emit the same code for a set of shaders when their files,
+sorted, are the same. Used to prove that a change to the translator
+(a split of a source file, a switch that is off) changes no output.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ apps/victory/src/translate.rs | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/apps/victory/src/translate.rs b/apps/victory/src/translate.rs
+index 640d21099..a0510c78b 100644
+--- a/apps/victory/src/translate.rs
++++ b/apps/victory/src/translate.rs
+@@ -541,6 +541,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
+                     match emit::emit(container, &p, &program, &s, &i, &r) {
+                         Ok(shader) => {
+                             census_line(&label(), &p, &program, &shader);
++                            sums_line(&label(), &shader);
+                             *counter(t, p.stage, 1) += 1;
+                             check(shader, t, checks, label);
+                         }
+@@ -563,6 +564,25 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
+     }
+ }
+ 
++/// `VICTORY_DXIL_SUMS=<file>`: one line per emitted program, appended: the
++/// BLAKE3 hash of its DXIL, the DXIL's length and the program's label. Two
++/// builds of the translator emit the same code for a set of shaders when
++/// their files, sorted, are the same (the lines come in the order the
++/// worker threads finish).
++fn sums_line(label: &str, shader: &emit::HostShader) {
++    use std::io::Write;
++    static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
++    let Some(out) = OUT.get_or_init(|| {
++        let path = std::env::var_os("VICTORY_DXIL_SUMS")?;
++        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
++        Some(Mutex::new(file))
++    }) else {
++        return;
++    };
++    let line = format!("{} {} {label}\n", blake3::hash(&shader.dxil).to_hex(), shader.dxil.len());
++    let _ = lock(out).write_all(line.as_bytes());
++}
++
+ /// `VICTORY_SHADER_CENSUS=<file>`: one line per emitted program, appended:
+ /// its label, the console program's instructions by encoding class (a
+ /// static count of the whole program, not of one thread's path), and the
+-- 
+2.56.0.windows.3
+

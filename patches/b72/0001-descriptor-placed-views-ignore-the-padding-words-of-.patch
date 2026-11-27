@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Thu, 26 Nov 2026 08:19:06 -0300
+Subject: [PATCH 1/4] descriptor: placed views ignore the padding words of the
+ resource description
+
+The title may leave words 1 and 13 of the 56-byte resource description it passes to device methods 0x230/0x238 unwritten, so the same view came in with different bytes there and every one was a new shape: the 2^22 shapes were full after half an hour, after which each placed view was a table entry kept for the run (34.9 million, 16.7 GB after 70 minutes on Series S). Only the named fields are copied now; the padding is zero.
+
+From JMAN730/project-flamingo b1e0cd1d (merged there through PR #620), with its test.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit f07e54a2bf2a6d925a7c535c2b5ee24d07b5872c)
+(cherry picked from commit 4eead678b38937f2156b3e151f1e15682c518ae6)
+---
+ crates/victory-gpu/src/descriptor.rs | 50 ++++++++++++++++++++++++++--
+ crates/victory-gpu/src/resource.rs   |  3 ++
+ 2 files changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
+index 63ad71b7c..3e3b1b3f8 100644
+--- a/crates/victory-gpu/src/descriptor.rs
++++ b/crates/victory-gpu/src/descriptor.rs
+@@ -923,6 +923,23 @@ pub(crate) extern "system" fn create_uav(
+     record(handle, view);
+ }
+ 
++/// Copy only the fields of a placed resource description. Padding can differ
++/// between two views of the same texture and the caller may leave it unwritten.
++fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
++    if desc.is_null() {
++        return None;
++    }
++    let src = desc.cast::<u32>();
++    let mut fields = [0; 14];
++    // SAFETY: the caller supplies a 56-byte ResourceDesc, possibly unaligned.
++    // Dimension occupies word 0. Alignment through Flags occupy words 2..13.
++    unsafe {
++        fields[0] = src.read_unaligned();
++        fields[2..13].copy_from_slice(&src.add(2).cast::<[u32; 11]>().read_unaligned());
++    }
++    Some(fields)
++}
++
+ /// Device methods 0x230 and 0x238: shader resource and unordered access
+ /// views of memory the title placed itself, `(resource desc, view desc,
+ /// handle)`.
+@@ -932,7 +949,7 @@ pub(crate) extern "system" fn create_placed_srv(
+     desc: *const [u32; 16],
+     handle: u64,
+ ) {
+-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
++    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), words(desc)) {
+         record(handle, View::Placed(false, resource, desc));
+     }
+ }
+@@ -943,7 +960,7 @@ pub(crate) extern "system" fn create_placed_uav(
+     desc: *const [u32; 16],
+     handle: u64,
+ ) {
+-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
++    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), words(desc)) {
+         record(handle, View::Placed(true, resource, desc));
+     }
+ }
+@@ -1259,6 +1276,35 @@ mod tests {
+         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+     }
+ 
++    #[test]
++    fn placed_views_share_resources_across_description_padding() {
++        let mut slot = [0u32; 8];
++        let handle = slot.as_mut_ptr() as u64;
++        let view_desc = [0u32; 16];
++        let null = std::ptr::null();
++        let mut resource = [3, 0, 0, 0, 8, 0, 8, 0x10001, 28, 1, 0, 0, 0, 0];
++        let expected = resource;
++        for (unordered, create) in [
++            (false, create_placed_srv as extern "system" fn(_, _, _, _)),
++            (true, create_placed_uav),
++        ] {
++            create(null, &expected, &view_desc, handle);
++            let first = slot;
++            resource[1] = 0xaaaa_aaaa;
++            resource[13] = 0xbbbb_bbbb;
++            create(null, &resource, &view_desc, handle);
++            assert_eq!(slot, first);
++            assert_eq!(
++                view(handle),
++                Some(View::Placed(unordered, expected, view_desc))
++            );
++            let mut other = resource;
++            other[12] = 4;
++            create(null, &other, &view_desc, handle);
++            assert_ne!(slot, first);
++        }
++    }
++
+     #[test]
+     fn views_survive_copies() {
+         let null = std::ptr::null();
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index b8da751e9..c95a843e3 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -118,6 +118,9 @@ pub(crate) fn readback_test_descriptions() -> (HeapProperties, ResourceDesc) {
+ 
+ const _: () = assert!(size_of::<HeapProperties>() == 20);
+ const _: () = assert!(size_of::<HeapDesc>() == 48);
++// placed_resource_words copies the two field spans on either side of the padding.
++const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
++const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
+ const _: () = assert!(size_of::<ResourceDesc>() == 56);
+ 
+ const BUFFER: u32 = 1;
+-- 
+2.56.0.windows.3
+

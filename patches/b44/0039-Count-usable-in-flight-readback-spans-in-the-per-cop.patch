@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 08:01:33 -0500
+Subject: [PATCH 39/43] Count usable in-flight readback spans in the per-copy
+ census
+
+(cherry picked from commit b57479c4c055daa6aee32b86aa59aa744db12659)
+---
+ crates/victory-gpu/src/census.rs | 5 ++++-
+ crates/victory-gpu/src/host.rs   | 4 +++-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-gpu/src/census.rs b/crates/victory-gpu/src/census.rs
+index 460380286..ef8e316ad 100644
+--- a/crates/victory-gpu/src/census.rs
++++ b/crates/victory-gpu/src/census.rs
+@@ -193,7 +193,10 @@ pub(crate) fn compared(start: u64, pieces: u64) {
+     }
+ }
+ 
+-/// `bytes` of the copy at `start` were fetched back from the card, in one piece.
++/// One span of `bytes` from the card copy at `start` was received for merging.
++/// For an in-flight slot this counts its usable span, after excluding any bytes
++/// already received from a newer fetch. Slot padding and bytes written back to
++/// title memory are separate from this count.
+ pub(crate) fn fetched(start: u64, bytes: u64) {
+     if !on() {
+         return;
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 6ef63a46d..1aadbcf34 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -4039,7 +4039,9 @@ impl Host {
+             // copy into it ran in the plan's flight, which the card has run.
+             let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+             written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+-            bytes += (hi - lo) as u64;
++            let landed = gpu.len() as u64;
++            bytes += landed;
++            crate::census::fetched(shadow.title_start(), landed);
+         }
+         for plan in plans {
+             for r in &plan.ranges {

@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Thu, 26 Nov 2026 17:38:29 +0800
+Subject: [PATCH 43/43] Local: VICTORY_KEEP_GONE: a texture picked by index
+ keeps its last view while its memory is away (off by default)
+
+The pass over textures picked by index made a slot's host view null when
+the title had unmapped the texture's memory ("streamed out"), and
+uploaded it again when the memory came back: in b43run2 that was 98,064
+slots, seen as door and window frames going texture, black, texture
+while the game streams from a hard disk.
+
+VICTORY_KEEP_GONE=1 skips that: the slot keeps showing its last host
+texture while the memory is away; it is still queued again
+(texture_slot_later) and uploaded when the memory returns. A number
+above 1 keeps the view for that many frames from the pass that first
+found it away, then makes it null as before. In both forms the view is
+made null at once while the card is over its video-memory budget (asked
+once a frame), since a kept view keeps its host copy from being let go.
+A log line every 4,096 looks counts the looks that kept a view, those
+that made it null, and the slots away now.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/draw.rs | 60 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index ddfb185d8..05d124c81 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -411,6 +411,57 @@ fn reupload_when_full() -> bool {
+     *ON.get_or_init(|| std::env::var_os("VICTORY_REUPLOAD_WHEN_FULL").is_none_or(|v| v != "0"))
+ }
+ 
++/// (local) `VICTORY_KEEP_GONE`: a texture picked by index whose memory the
++/// title has unmapped ("streamed out") keeps its host view, so the slot
++/// goes on showing its last texture while the memory is away, instead of
++/// a null view (black) until it is back and uploaded again. Off by default.
++/// - `1`: kept for as long as the memory is away;
++/// - a larger number: kept for that many frames from the pass that first
++///   found it away, then made null as before.
++/// Either way the view is made null at once while the card is over its
++/// video-memory budget (a kept view keeps its host copy from being let
++/// go). True if slot `index` is to be kept in frame `frame`.
++fn keep_gone(index: u32, frame: u64) -> bool {
++    use std::sync::{Mutex, OnceLock};
++    static FRAMES: OnceLock<u64> = OnceLock::new();
++    let frames = *FRAMES.get_or_init(|| std::env::var("VICTORY_KEEP_GONE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
++    if frames == 0 {
++        return false;
++    }
++    /// The frame the budget was last asked in, and whether the card was over it.
++    static OVER: Mutex<(u64, bool)> = Mutex::new((u64::MAX, false));
++    let over = {
++        let mut o = OVER.lock().unwrap_or_else(|e| e.into_inner());
++        if o.0 != frame {
++            let over = crate::host::host().and_then(|h| h.video_memory_groups()).is_some_and(|[own, _]| own[0] != 0 && own[1] > own[0]);
++            *o = (frame, over);
++        }
++        o.1
++    };
++    let mut since = KEEP_GONE_SINCE.lock().unwrap_or_else(|e| e.into_inner());
++    let first = *since.entry(index).or_insert(frame);
++    let keep = !over && (frames == 1 || frame.saturating_sub(first) < frames);
++    if !keep {
++        since.remove(&index);
++    }
++    let n = KEEP_GONE[usize::from(!keep)].fetch_add(1, Ordering::Relaxed) + 1;
++    if n.is_multiple_of(4096) {
++        tracing::info!(
++            "textures picked by index whose memory is away (VICTORY_KEEP_GONE={frames}) since the start: {} looks kept the last view, {} made null (kept long enough, or the card over its budget); {} slots away now",
++            KEEP_GONE[0].load(Ordering::Relaxed),
++            KEEP_GONE[1].load(Ordering::Relaxed),
++            since.len()
++        );
++    }
++    keep
++}
++
++/// [`keep_gone`]: looks that kept the view, looks that made it null.
++static KEEP_GONE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
++
++/// [`keep_gone`]: the frame each slot was first found away in.
++static KEEP_GONE_SINCE: std::sync::Mutex<std::collections::BTreeMap<u32, u64>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
++
+ /// Whether textures picked by index are looked at again after their upload
+ /// (`VICTORY_HEAP_RECHECK=0`: no).
+ fn heap_recheck() -> bool {
+@@ -1919,10 +1970,17 @@ impl State {
+                 if mapped == 0 {
+                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+                     // Streamed out: what the slot showed is let go.
+-                    host.texture_slot_gone(index);
++                    // (`VICTORY_KEEP_GONE`: it keeps showing it meanwhile.)
++                    if !keep_gone(index, frame) {
++                        host.texture_slot_gone(index);
++                    }
+                     host.texture_slot_later(index, write, frame, most);
+                     continue;
+                 }
++                if !KEEP_GONE_SINCE.is_poisoned() && KEEP_GONE[0].load(Ordering::Relaxed) != 0 {
++                    // Back: a later absence starts its count anew.
++                    KEEP_GONE_SINCE.lock().unwrap_or_else(|e| e.into_inner()).remove(&index);
++                }
+                 if mapped < len {
+                     if mapped <= host.texture_slot_mapped(index) {
+                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);

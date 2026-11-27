@@ -1,0 +1,182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Tue, 24 Nov 2026 17:12:36 -0700
+Subject: [PATCH 12/43] Shaders: a sampler used with and without comparison
+ gets two slots
+
+Static sampler slots were deduplicated by the four sampler words alone.
+The same words used for an ordinary sample and a comparison sample
+shared a slot, and the comparison use marked it as a comparison one:
+the ordinary sample then got a comparison handle (or, met in the other
+order, a handle and slot metadata that disagreed). The DXIL validator
+requires the sampler kind to match the operation.
+
+A slot is now chosen by the words and whether the use compares, so the
+two ways get their own slots, and the slot's kind is fixed at its first
+use instead of folded into a bitfield later. The comparison bit moves
+from the Lowered bitfield into the slot list (its kind travels with it).
+
+AI use: written with Codex and Claude Code (GPT-5.2 Codex); reviewed and
+posted with my approval. No game files were used.
+
+(cherry picked from commit 6390a18bce944adef78c99b4fab07c67fb551b14)
+(cherry picked from commit cc7b8718f02b442f570448406c933e0a7e1c233b)
+---
+ .../src/emit/intersect_tests.rs               |  2 +-
+ crates/victory-shader/src/emit/lower.rs       | 30 +++++++++++--------
+ crates/victory-shader/src/emit/mod.rs         |  7 ++---
+ crates/victory-shader/src/emit/valu_tests.rs  |  2 +-
+ .../src/emit/waterfall_tests.rs               |  2 +-
+ .../victory-shader/src/emit/wave64_tests.rs   |  2 +-
+ 6 files changed, 24 insertions(+), 21 deletions(-)
+
+diff --git a/crates/victory-shader/src/emit/intersect_tests.rs b/crates/victory-shader/src/emit/intersect_tests.rs
+index 0266579ac..ff9feef05 100644
+--- a/crates/victory-shader/src/emit/intersect_tests.rs
++++ b/crates/victory-shader/src/emit/intersect_tests.rs
+@@ -182,7 +182,7 @@ fn build(
+         stage: HwStage::Cs,
+         dxil: lowered.dxil,
+         user_data: lowered.user_data,
+-        samplers: lowered.samplers,
++        samplers: lowered.samplers.iter().map(|&(w, _)| w).collect(),
+         static_samplers: Vec::new(),
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 253ce2cd9..a4e559cea 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -50,13 +50,14 @@ enum Val {
+ 
+ pub(crate) struct Lowered {
+     pub dxil: Vec<u8>,
+-    /// Bit n: immediate sampler n is used for comparisons.
+-    pub cmp_samplers: u64,
+     pub root_cbvs: Vec<u8>,
+     pub root_srvs: Vec<u8>,
+     pub root_uavs: Vec<u8>,
+     pub user_data: Vec<UserData>,
+-    pub samplers: Vec<[u32; 4]>,
++    /// Immediate samplers in slot order: their four words, and whether the
++    /// slot is a comparison sampler (a sampler used both ways holds two
++    /// slots, one for each way).
++    pub samplers: Vec<([u32; 4], bool)>,
+     /// The wave size the shader requires of the host, if any.
+     pub wave_size: Option<u32>,
+     /// Heap handles made with a non-uniform index.
+@@ -201,7 +202,7 @@ struct Lower<'a> {
+     params: HashMap<Value, (usize, u32)>,
+     user_data: Option<V>,
+     user_reads: BTreeMap<u32, UserData>,
+-    samplers: Vec<[u32; 4]>,
++    samplers: Vec<([u32; 4], bool)>,
+     descriptors: HashMap<(Site, bool), &'a Source>,
+     scalar: HashMap<Site, Address>,
+     exports: HashMap<Site, &'a Export>,
+@@ -2277,11 +2278,9 @@ impl<'a> Lower<'a> {
+         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
+         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+-        let cmp_samplers = self.s.cmp_samplers;
+         let wave_size = self.s.wave_size;
+         Ok(Lowered {
+             wave_size,
+-            cmp_samplers,
+             root_cbvs,
+             root_srvs,
+             root_uavs,
+@@ -6321,18 +6320,23 @@ impl<'a> Lower<'a> {
+                     .get(..4)
+                     .and_then(|w| w.try_into().ok())
+                     .ok_or("a sampler constant")?;
+-                let n = match self.samplers.iter().position(|w| *w == words) {
++                // A comparison use needs a comparison sampler on the host
++                // (the DXIL validator requires the kinds to match), so a
++                // sampler used both ways gets one slot for each way.
++                let cmp = props.0 & 0x8000 != 0;
++                let n = match self.samplers.iter().position(|&(w, c)| w == words && c == cmp) {
+                     Some(n) => n,
+                     None => {
+-                        self.samplers.push(words);
++                        self.samplers.push((words, cmp));
+                         self.samplers.len() - 1
+                     }
+                 };
+-                if props.0 & 0x8000 != 0 {
+-                    // shortcut: one sampler used with and without comparison
+-                    // would need two static samplers; it becomes a comparison one.
+-                    self.s.cmp_samplers |= 1 << n;
+-                }
++                let bit = 1 << n;
++                self.s.cmp_samplers = if cmp {
++                    self.s.cmp_samplers | bit
++                } else {
++                    self.s.cmp_samplers & !bit
++                };
+                 Ok(self.s.sampler_handle(self.cur, n as u32))
+             }
+             Source::Constant(_) => Err("a constant resource descriptor"),
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index ab488a23c..c2b3b12ff 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -690,16 +690,15 @@ fn emit_program(
+         static_samplers: l
+             .samplers
+             .iter()
+-            .enumerate()
+-            .map(|(n, &w)| {
++            .map(|&(w, cmp)| {
+                 let mut s = StaticSampler::from_words(w);
+-                if l.cmp_samplers >> n & 1 != 0 {
++                if cmp {
+                     s.filter |= 0x80;
+                 }
+                 s
+             })
+             .collect(),
+-        samplers: l.samplers,
++        samplers: l.samplers.iter().map(|&(w, _)| w).collect(),
+         root_cbvs: l.root_cbvs,
+         root_srvs: l.root_srvs,
+         root_uavs: l.root_uavs,
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index f5c20145a..9692bfe95 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -175,7 +175,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
+         stage: HwStage::Cs,
+         dxil: lowered.dxil,
+         user_data: lowered.user_data,
+-        samplers: lowered.samplers,
++        samplers: lowered.samplers.iter().map(|&(w, _)| w).collect(),
+         static_samplers: Vec::new(),
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,
+diff --git a/crates/victory-shader/src/emit/waterfall_tests.rs b/crates/victory-shader/src/emit/waterfall_tests.rs
+index 18425e06c..496f9289b 100644
+--- a/crates/victory-shader/src/emit/waterfall_tests.rs
++++ b/crates/victory-shader/src/emit/waterfall_tests.rs
+@@ -78,7 +78,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
+         stage: HwStage::Cs,
+         dxil: lowered.dxil,
+         user_data: lowered.user_data,
+-        samplers: lowered.samplers,
++        samplers: lowered.samplers.iter().map(|&(w, _)| w).collect(),
+         static_samplers: Vec::new(),
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,
+diff --git a/crates/victory-shader/src/emit/wave64_tests.rs b/crates/victory-shader/src/emit/wave64_tests.rs
+index 55cc55de1..cf1bf1ce2 100644
+--- a/crates/victory-shader/src/emit/wave64_tests.rs
++++ b/crates/victory-shader/src/emit/wave64_tests.rs
+@@ -126,7 +126,7 @@ fn lowered_on(
+         stage: HwStage::Cs,
+         dxil: lowered.dxil,
+         user_data: lowered.user_data,
+-        samplers: lowered.samplers,
++        samplers: lowered.samplers.iter().map(|&(w, _)| w).collect(),
+         static_samplers: Vec::new(),
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,

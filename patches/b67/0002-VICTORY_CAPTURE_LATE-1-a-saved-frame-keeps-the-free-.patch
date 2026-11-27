@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Sat, 28 Nov 2026 00:40:42 +0800
+Subject: [PATCH 2/2] VICTORY_CAPTURE_LATE=1: a saved frame keeps the free
+ present
+
+Off by default: a frame that is saved is presented the old way, as
+before. With the switch, a frame saved for its picture alone is sent
+ahead like every other present (late_free_present); its picture is
+copied into a read-back buffer inside that flight and written out by a
+thread of ours ("victory frame saver") once the card has run the
+flight: the mapping, the half-size picture, its compression and the
+file are that thread's work. Listed frames (VICTORY_CAPTURE_FRAMES, the
+world's frames, a trigger's) keep the old way: their operations and
+targets are written too.
+
+Why: a saved frame's present settled every flight in the air and read
+the frame back at once, holding the submission lock meanwhile. With a
+picture of every second frame the submitting thread waited 64 to 83 ms a
+frame for that lock, and 64 to 145 ms with a picture of every frame
+(run 66), in frames of 270 to 420 ms.
+
+Not tested beyond compiling and the existing tests: what it does shows
+only in a run (pictures still arriving for every saved frame; the
+"waiting for the submission lock" figure). A flight that has not
+finished after ten seconds is given up on and said in the log.
+
+victory-gpu: 154 passed (163 with diagnostics), 0 failed.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+(cherry picked from commit 355746e0724594bbb748a4d768e2367cbb6065b2)
+---
+ crates/victory-gpu/src/capture.rs | 75 +++++++++++++++++++++++++++++++
+ crates/victory-gpu/src/host.rs    | 45 +++++++++++++++----
+ 2 files changed, 111 insertions(+), 9 deletions(-)
+
+diff --git a/crates/victory-gpu/src/capture.rs b/crates/victory-gpu/src/capture.rs
+index a0ba48aae..856b664ed 100644
+--- a/crates/victory-gpu/src/capture.rs
++++ b/crates/victory-gpu/src/capture.rs
+@@ -411,6 +411,81 @@ pub(crate) fn save_read_back(
+     }
+ }
+ 
++/// Whether a frame that is saved for its picture only is presented as
++/// every other frame is, its picture read back inside the present's own
++/// flight and written out by a thread of ours once the card has run it
++/// (`VICTORY_CAPTURE_LATE=1`; off by default: a saved frame is presented
++/// the old way, the flights settled at the present and the picture read
++/// back and compressed there, under the submission lock).
++///
++/// Why: with a picture of every frame or every second one, the thread
++/// that submits waited 64 to 83 ms a frame for the submission lock in the
++/// runs looked at, the size of one settle of 120 to 170 ms every second
++/// frame. Listed frames (their operations and targets are written too)
++/// keep the old way.
++pub(crate) fn late() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        let on = std::env::var("VICTORY_CAPTURE_LATE").is_ok_and(|v| v.trim() == "1");
++        if on {
++            tracing::info!("saved frames are read back inside their present's flight and written out behind it (VICTORY_CAPTURE_LATE=1)");
++        }
++        on
++    })
++}
++
++/// A frame's picture in a read-back buffer the card fills in submission
++/// `flown` ([`save_later`]).
++struct Later {
++    frame: u64,
++    buffer: ID3D12Resource,
++    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
++    flown: u64,
++}
++
++// SAFETY: host buffers are free-threaded objects; the footprint is plain
++// data. The buffer is touched by one thread at a time: recorded into a
++// list here, then handed to the thread that saves, which alone maps it.
++unsafe impl Send for Later {}
++
++/// Saves frame `frame` from `buffer` ([`read_back`]) once submission
++/// `flown` has finished, on a thread of ours: the mapping, the half-size
++/// picture, its compression and the file are that thread's work. A
++/// submission that has not finished after ten seconds is given up on (the
++/// device is gone, or the run is ending).
++pub(crate) fn save_later(frame: u64, buffer: ID3D12Resource, footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT, flown: u64) {
++    static QUEUE: std::sync::OnceLock<Option<std::sync::Mutex<std::sync::mpsc::Sender<Later>>>> = std::sync::OnceLock::new();
++    let queue = QUEUE.get_or_init(|| {
++        let (send, receive) = std::sync::mpsc::channel::<Later>();
++        let made = std::thread::Builder::new().name("victory frame saver".into()).spawn(move || {
++            for later in receive {
++                let began = std::time::Instant::now();
++                while crate::host::finished() < later.flown {
++                    if began.elapsed() > std::time::Duration::from_secs(10) {
++                        break;
++                    }
++                    std::thread::sleep(std::time::Duration::from_millis(2));
++                }
++                if crate::host::finished() >= later.flown {
++                    save_read_back(later.frame, &later.buffer, &later.footprint);
++                } else {
++                    tracing::warn!(frame = later.frame, "frame not saved: the card did not run its present in ten seconds");
++                }
++            }
++        });
++        match made {
++            Ok(_) => Some(std::sync::Mutex::new(send)),
++            Err(e) => {
++                tracing::warn!(error = %e, "no thread to save frames: they are not saved");
++                None
++            }
++        }
++    });
++    if let Some(queue) = queue {
++        let _ = queue.lock().unwrap_or_else(|e| e.into_inner()).send(Later { frame, buffer, footprint, flown });
++    }
++}
++
+ /// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
+ /// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
+ /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index a9d72157a..1124eb0a9 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -76,6 +76,12 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+ static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ 
++/// The number of the last submission that has finished ([`FINISHED`]).
++#[cfg(feature = "diagnostics")]
++pub(crate) fn finished() -> u64 {
++    FINISHED.load(Ordering::Acquire)
++}
++
+ /// A retired object, dropped on whatever thread finishes the submission.
+ struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
+ // SAFETY: what is retired is D3D12 objects (free-threaded) and the
+@@ -6839,8 +6845,11 @@ impl Host {
+             // Sent ahead ([`late_free_present`]) unless the frame is to be
+             // read back at once (a saved or listed frame): then a list of
+             // its own, one whose last flight has finished or a new one.
++            // (With `VICTORY_CAPTURE_LATE=1` a frame saved for its picture
++            // alone is sent ahead too, its picture read back in that
++            // flight and written out behind it: `capture::save_later`.)
+             #[cfg(feature = "diagnostics")]
+-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
++            let read_now = crate::capture::listed(frame) || crate::capture::wanted(frame) && !crate::capture::late();
+             #[cfg(not(feature = "diagnostics"))]
+             let read_now = false;
+             let slot = if late_free_present() && !read_now {
+@@ -6907,17 +6916,26 @@ impl Host {
+                         })
+                         .flatten();
+                     copy.close();
+-                    match slot {
++                    let flown = match slot {
+                         Some(i) => {
+                             let flown = self.execute_own(copy);
+                             p.ahead[i].1 = flown;
++                            Some(flown)
+                         }
+-                        None => self.execute(&[copy]),
+-                    }
++                        None => {
++                            self.execute(&[copy]);
++                            None
++                        }
++                    };
+                     #[cfg(feature = "diagnostics")]
+                     if let Some((buffer, footprint)) = capture {
+-                        crate::capture::save_read_back(frame, &buffer, &footprint);
++                        match flown {
++                            Some(flown) => crate::capture::save_later(frame, buffer, footprint, flown),
++                            None => crate::capture::save_read_back(frame, &buffer, &footprint),
++                        }
+                     }
++                    #[cfg(not(feature = "diagnostics"))]
++                    let _ = flown;
+                     let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+                     p.meter.frame(p.hwnd);
+                     return Some(false);
+@@ -6949,17 +6967,26 @@ impl Host {
+                 ),
+             ]);
+             copy.close();
+-            match slot {
++            let flown = match slot {
+                 Some(i) => {
+                     let flown = self.execute_own(copy);
+                     p.ahead[i].1 = flown;
++                    Some(flown)
+                 }
+-                None => self.execute(&[copy]),
+-            }
++                None => {
++                    self.execute(&[copy]);
++                    None
++                }
++            };
+             #[cfg(feature = "diagnostics")]
+             if let Some((buffer, footprint)) = capture {
+-                crate::capture::save_read_back(frame, &buffer, &footprint);
++                match flown {
++                    Some(flown) => crate::capture::save_later(frame, buffer, footprint, flown),
++                    None => crate::capture::save_read_back(frame, &buffer, &footprint),
++                }
+             }
++            #[cfg(not(feature = "diagnostics"))]
++            let _ = flown;
+             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+             p.meter.frame(p.hwnd);
+             #[cfg(feature = "diagnostics")]
+-- 
+2.56.0.windows.3
+

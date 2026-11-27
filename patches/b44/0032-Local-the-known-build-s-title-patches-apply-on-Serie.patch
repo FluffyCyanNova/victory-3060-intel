@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 22:56:45 +0800
+Subject: [PATCH 32/43] Local: the known build's title patches apply on Series
+ S only
+
+Fork #798 patches the title's upscaler choice for the known build on
+every run. A Series X run now maps the title's code unchanged, as before
+that change (same prepared image name, no patch line in the log);
+VICTORY_TITLE_PATCHES=1 applies the patches on a Series X too, =0 still
+turns them off, VICTORY_TITLE_PATCH entries apply as given.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ apps/victory/src/run.rs | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/apps/victory/src/run.rs b/apps/victory/src/run.rs
+index ddb4204c4..eda952ed3 100644
+--- a/apps/victory/src/run.rs
++++ b/apps/victory/src/run.rs
+@@ -27,7 +27,12 @@ pub fn run(
+         Some(build) => println!("build          {} ({hash})", build.label),
+         None => println!("build          unknown ({hash})"),
+     }
+-    apply_title_patches(&mut prepared, build)?;
++    // (local) The known build's patches are for the Series S profile only: a
++    // Series X run maps the title's code unchanged, as before fork #798.
++    // `VICTORY_TITLE_PATCHES=1` applies them on a Series X too.
++    let series_s = matches!(console, Console::SeriesS)
++        || std::env::var("VICTORY_TITLE_PATCHES").as_deref() == Ok("1");
++    apply_title_patches(&mut prepared, build.filter(|_| series_s))?;
+ 
+     let images = cfg.cache_subdir("images")?;
+     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);

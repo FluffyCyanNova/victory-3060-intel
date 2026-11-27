@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Fri, 27 Nov 2026 00:34:37 +0800
+Subject: [PATCH 3/3] Copy stats say how many refreshed bytes come from pages
+ taken whole and from pages copied in part
+
+Diagnostics builds: a new line 'refreshes per frame: taken N MB whole, N MB in
+part' from two counters in Shadow::copy_stale. A page only partly in a
+refreshed range is copied in part and stays stale, so every later refresh
+reaching it copies it again; this says how much of a frame's refreshes that is
+(upstream pull request #3289 widens refreshes to whole pages). No behaviour
+change.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/copystat.rs | 17 +++++++++++++++--
+ crates/victory-gpu/src/shadow.rs   | 10 +++++++++-
+ 2 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/crates/victory-gpu/src/copystat.rs b/crates/victory-gpu/src/copystat.rs
+index cae74b24a..ddbc44d66 100644
+--- a/crates/victory-gpu/src/copystat.rs
++++ b/crates/victory-gpu/src/copystat.rs
+@@ -133,8 +133,14 @@ pub(crate) enum C {
+     /// `watch::writes` askings not made because the range's first block is
+     /// already known to be guarded view memory (no kernel call).
+     WatchKnownView,
++    /// `Shadow::copy_stale`: bytes copied from pages the refresh took whole
++    /// (stamped: not copied again until the title writes them), and from
++    /// pages only partly in the refreshed range (copied in part and left
++    /// stale: copied again by every later refresh that reaches them).
++    TakenWholeBytes,
++    TakenPartBytes,
+ }
+-const COUNTERS: usize = 80;
++const COUNTERS: usize = 82;
+ static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+ 
+ pub(crate) fn add(c: C, n: u64) {
+@@ -1086,8 +1092,15 @@ pub(crate) fn log(frames: f64) {
+         .collect();
+     let mb = |v: f64| v / 1e6;
+     let ms = |v: f64| v / 1e3;
++    // How much of the refreshes is pages copied in part, again and again
++    // (upstream pull request #3289 widens refreshes to whole pages).
+     tracing::info!(
+-        "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
++        "refreshes per frame: taken {:.1} MB whole, {:.1} MB in part",
++        mb(c[C::TakenWholeBytes as usize]),
++        mb(c[C::TakenPartBytes as usize]),
++    );
++    tracing::info!(
++        "copies per frame:{:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
+          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
+          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
+          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index 05a052915..32d21e110 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -3041,9 +3041,17 @@ impl Shadow {
+                 // A page only partly in the range is copied in part: it
+                 // stays stale for the rest.
+                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
++                let whole = (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
++                if whole {
+                     *at = now;
+                 }
++                // Counted: the bytes of this page that are copied, by
++                // whether the page is taken (the frame's copy line).
++                #[cfg(feature = "diagnostics")]
++                crate::copystat::add(
++                    if whole { crate::copystat::C::TakenWholeBytes } else { crate::copystat::C::TakenPartBytes },
++                    (((page + 1) * PAGE).min(to) - (page * PAGE).max(from)) as u64,
++                );
+                 run.get_or_insert(page);
+             } else if let Some(first) = run.take() {
+                 bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));

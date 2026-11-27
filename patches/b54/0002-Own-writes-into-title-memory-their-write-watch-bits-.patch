@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Thu, 26 Nov 2026 23:48:40 +0800
+Subject: [PATCH 2/3] Own writes into title memory: their write-watch bits are
+ reset only while the submission's asking stands
+
+watch::forgot (fork #827) drops the kernel's dirty bits behind a write of ours.
+The journal is told of that write by watch::wrote, which does nothing unless a
+submission's one asking stands (VICTORY_ASK_ONCE=0, or an asking that found no
+watched range). Without it the bits were the only word of the write, and the
+host copies of the destination kept the bytes from before. Now the bits are
+left set in that case, as before the port.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/host.rs  | 6 +++++-
+ crates/victory-gpu/src/watch.rs | 6 ++++++
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 416391966..cbf740dec 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -6147,7 +6147,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
+         // A title destination the kernel wrote: its pages' dirty bits are
+         // the layer's own write. Left set, the next refresh reports them as
+         // the title's and copies the same bytes up again, every frame.
+-        if title_dst {
++        // Only while the submission's one asking stands: then the caller
++        // tells the journal of this write (`crate::watch::wrote`). With no
++        // asking standing the journal learns of it from these very bits,
++        // and the host copies of the destination would keep the old bytes.
++        if title_dst && crate::watch::asking_stands() {
+             crate::watch::forgot(dst as usize, len);
+         }
+         return;
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index 407982397..efe7afa3e 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -232,6 +232,12 @@ pub(crate) fn ask_once_end() {
+     }
+ }
+ 
++/// Whether a submission's one asking stands ([`ask_once`]): [`wrote`] then
++/// tells the journal of a write of ours, and does nothing otherwise.
++pub(crate) fn asking_stands() -> bool {
++    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).kept
++}
++
+ /// We wrote title memory `[at, at + len)` while a submission's one asking
+ /// stands (the title's buffer copies, done at submission): its pages count
+ /// as written after that asking, so the refreshes that follow copy them.

@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Fri, 27 Nov 2026 14:20:07 +0100
+Subject: [PATCH 4/4] Test: placed views keep the resource description's
+ padding words as zero
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 8bff6c21b9c76fbf8545ef7a577af52bb671c007)
+---
+ crates/victory-gpu/src/descriptor.rs | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
+index 4dc4db214..4b31e6429 100644
+--- a/crates/victory-gpu/src/descriptor.rs
++++ b/crates/victory-gpu/src/descriptor.rs
+@@ -1549,8 +1549,9 @@ mod tests {
+         let null = std::ptr::null();
+         let slots = [0u64; 4];
+         let at = slots.as_ptr() as u64;
+-        // A resource description and a view no other test uses.
+-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
++        // A resource description and a view no other test uses; words 1 and
++        // 13 are the description's padding, which placed views keep as zero.
++        let resource: [u32; 14] = std::array::from_fn(|k| if k == 1 || k == 13 { 0 } else { 0x5ee0_0000 + k as u32 });
+         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+         let mine = |v: &View| match v {
+             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
+-- 
+2.56.0.windows.3
+

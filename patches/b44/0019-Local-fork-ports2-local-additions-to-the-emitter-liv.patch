@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 14:51:53 +0800
+Subject: [PATCH 19/43] Local (fork-ports2): local additions to the emitter
+ live in a child module
+
+lower.rs stays under the asset policy's 512 KiB: the not-a-number position of a
+vertex the loop limit stops moves to emit/lower_local.rs, which also takes the
+check of the texture-size port. Unbuilt.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-shader/src/emit/lower.rs       | 24 ++-------
+ crates/victory-shader/src/emit/lower_local.rs | 49 +++++++++++++++++++
+ 2 files changed, 53 insertions(+), 20 deletions(-)
+ create mode 100644 crates/victory-shader/src/emit/lower_local.rs
+
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 24ee44b4d..da30d24cc 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -24,6 +24,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
+ /// it shares the emitter's state.
+ #[path = "intersect.rs"]
+ pub(super) mod intersect;
++#[path = "lower_local.rs"]
++mod local;
+ 
+ type Why = &'static str;
+ 
+@@ -11235,26 +11237,8 @@ impl<'a> Lower<'a> {
+             let t = self.s.m.bool(true);
+             self.s
+                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+-        } else if self.s.threads.is_none() && self.s.geometry.is_none() {
+-            // A vertex stopped here has no position (or half of one): the
+-            // host would draw whatever its register holds, a triangle
+-            // stretched across the screen. A position that is not a number
+-            // has the rasteriser drop every triangle the vertex is in.
+-            if let Some(id) = self
+-                .s
+-                .outputs
+-                .iter()
+-                .position(|o| o.kind == 3 && o.comp == 9 && o.row.is_some())
+-            {
+-                let cols = self.s.outputs[id].cols;
+-                self.s.outputs[id].usage |= (1u8 << cols) - 1;
+-                let nan = self.s.m.f32(f32::NAN.to_bits());
+-                let void = self.s.t.void;
+-                for col in 0..cols {
+-                    let args = [self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(col), nan];
+-                    self.s.op(a, "storeOutput.f32", Attr::NoUnwind, void, 5, &args);
+-                }
+-            }
++        } else {
++            self.nan_position(a);
+         }
+         self.s.m.terminate(a, Term::Ret);
+         self.abort = Some(a);
+diff --git a/crates/victory-shader/src/emit/lower_local.rs b/crates/victory-shader/src/emit/lower_local.rs
+new file mode 100644
+index 000000000..1a24d1ff4
+--- /dev/null
++++ b/crates/victory-shader/src/emit/lower_local.rs
+@@ -0,0 +1,49 @@
++//! Local additions to the emitter (fork-ports), kept out of `lower.rs`,
++//! which the asset policy holds under 512 KiB. A child module, so it shares
++//! the emitter's state.
++
++use super::*;
++
++impl Lower<'_> {
++    /// A vertex stopped at the loop limit has no position (or half of one):
++    /// the host would draw whatever its register holds, a triangle stretched
++    /// across the screen. A position that is not a number has the rasteriser
++    /// drop every triangle the vertex is in. `a` is the block the lane
++    /// leaves through.
++    pub(super) fn nan_position(&mut self, a: usize) {
++        if self.s.threads.is_some() || self.s.geometry.is_some() {
++            return;
++        }
++        let Some(id) = self
++            .s
++            .outputs
++            .iter()
++            .position(|o| o.kind == 3 && o.comp == 9 && o.row.is_some())
++        else {
++            return;
++        };
++        let cols = self.s.outputs[id].cols;
++        self.s.outputs[id].usage |= (1u8 << cols) - 1;
++        let nan = self.s.m.f32(f32::NAN.to_bits());
++        let void = self.s.t.void;
++        for col in 0..cols {
++            let args = [self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(col), nan];
++            self.s.op(a, "storeOutput.f32", Attr::NoUnwind, void, 5, &args);
++        }
++    }
++
++    /// Whether scalar arithmetic reads dword 2 or 3 of the descriptor that
++    /// `inst` loads from the start of an entry (`offset`, in bytes) into
++    /// `count` registers from `code` on: the console compiler folded
++    /// GetDimensions into reads of an image descriptor.
++    pub(super) fn size_read(&self, inst: &Inst, code: u8, count: u32, offset: Option<u32>) -> bool {
++        let p = self.x.p;
++        let read = |v: Value| {
++            p.blocks
++                .iter()
++                .any(|b| b.insts.iter().any(|i| matches!(i.fields, Fields::Sop { .. }) && i.reads.iter().any(|r| r.1 == v)))
++        };
++        offset.is_some_and(|o| o % 32 == 0)
++            && (2..count.min(4)).any(|k| inst.write(Reg::S(code + k as u8)).is_some_and(read))
++    }
++}

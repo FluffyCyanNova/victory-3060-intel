@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 13:52:16 +0800
+Subject: [PATCH 03/43] Local (fork-ports): view memory in place, behind
+ VICTORY_INPLACE_VIEWS=1
+
+One committed view of the page pool's section is opened by its address like
+private memory (off unless the switch is set; the first host refusal turns it
+off for the run). The start-up probe gains a line: a committed view of a
+reserved section opened whole and in part. Unbuilt.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/inplace.rs | 88 ++++++++++++++++++++++++++++---
+ 1 file changed, 81 insertions(+), 7 deletions(-)
+
+diff --git a/crates/victory-gpu/src/inplace.rs b/crates/victory-gpu/src/inplace.rs
+index 60751b53c..5767ac28f 100644
+--- a/crates/victory-gpu/src/inplace.rs
++++ b/crates/victory-gpu/src/inplace.rs
+@@ -90,6 +90,26 @@ pub(crate) fn level() -> u8 {
+     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+ }
+ 
++/// `VICTORY_INPLACE_VIEWS=1` (local, fork-ports): view memory (the page
++/// pool) is tried in place too, where the range is one committed view of
++/// the pool's section. The section is made reserved, so it cannot be
++/// opened by its handle; a view of it committed whole was opened by its
++/// address on an RTX 3060 (the worker's probe, 2026-11-25; by
++/// `OpenExistingHeapFromAddress`, the whole view: a part of one through
++/// `OpenExistingHeapFromAddress1` is what the probe's new line tries).
++/// What a view shows changes when the title maps pages:
++/// [`title_memory_freeing`] lets go of what is in place there, as for
++/// private memory.
++fn views_too() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("VICTORY_INPLACE_VIEWS").is_ok_and(|v| v.trim() == "1"))
++}
++
++/// The host refused a view once: no more are asked for.
++static VIEWS_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++/// Views placed since the start, and their bytes.
++static VIEWS_PLACED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
++
+ /// The most title memory in place at once, in bytes
+ /// (`VICTORY_INPLACE_MB`, 4096): opening locks the pages into the PC's
+ /// memory, also those the title never touched.
+@@ -119,9 +139,15 @@ pub(crate) struct Placed {
+ /// with nothing if the memory is not private memory committed whole
+ /// (nothing was asked of the host), with the host's error if it refused.
+ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
++    place_whole(device, start, len, mem::MEM_PRIVATE)
++}
++
++/// [`place_part`] for memory of `kind` (`MEM_PRIVATE`, or `MEM_MAPPED` for
++/// one committed view of a section).
++fn place_whole(device: &ID3D12Device, start: u64, len: u64, kind: u32) -> Result<Placed, Option<windows::core::Error>> {
+     let at = start & !(K64 as u64 - 1);
+     let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+-    if !private_whole(at as usize, bytes as usize) {
++    if !whole(at as usize, bytes as usize, kind) {
+         return Err(None);
+     }
+     let heap = open(device, From::Part(at as usize, bytes as usize)).map_err(Some)?;
+@@ -139,17 +165,30 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
+         return None;
+     }
+     // View memory: known from the runtime without asking Windows.
+-    if cover(start as usize, len as usize) != Cover::None {
+-        STATS[4].fetch_add(1, Ordering::Relaxed);
+-        return None;
+-    }
++    let kind = match cover(start as usize, len as usize) {
++        Cover::None => mem::MEM_PRIVATE,
++        // One run of one section, and the switch is on: tried as one
++        // committed view (`whole` turns down a run of several views).
++        Cover::Run(..) if views_too() && !VIEWS_REFUSED.load(Ordering::Relaxed) => mem::MEM_MAPPED,
++        _ => {
++            STATS[4].fetch_add(1, Ordering::Relaxed);
++            return None;
++        }
++    };
+     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+         STATS[6].fetch_add(1, Ordering::Relaxed);
+         return None;
+     }
+     let host = crate::host::host()?;
+-    match place_part(&host.device, start, len) {
++    match place_whole(&host.device, start, len, kind) {
+         Ok(placed) => {
++            if kind == mem::MEM_MAPPED {
++                let n = VIEWS_PLACED[0].fetch_add(1, Ordering::Relaxed) + 1;
++                let bytes = VIEWS_PLACED[1].fetch_add(len, Ordering::Relaxed) + len;
++                if n.is_power_of_two() {
++                    tracing::info!(views = n, mb = bytes >> 20, "view memory in place (VICTORY_INPLACE_VIEWS), since the start");
++                }
++            }
+             let at = if window { 0 } else { 2 };
+             STATS[at].fetch_add(1, Ordering::Relaxed);
+             STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+@@ -160,6 +199,10 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
+             None
+         }
+         Err(Some(e)) => {
++            if kind == mem::MEM_MAPPED {
++                // The host does not take views: asked once, never again.
++                VIEWS_REFUSED.store(true, Ordering::Relaxed);
++            }
+             if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                 tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "title memory not opened in place: a copy instead");
+             }
+@@ -443,13 +486,20 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
+ /// one's state: a millisecond in the title's big blocks, so ask when a
+ /// copy is made, not when it is used).
+ pub(crate) fn private_whole(at: usize, len: usize) -> bool {
++    whole(at, len, mem::MEM_PRIVATE)
++}
++
++/// Whether `[at, at + len)` is memory of `kind` (`MEM_PRIVATE`, or
++/// `MEM_MAPPED`: then one view of a section), all committed and
++/// read-write.
++fn whole(at: usize, len: usize, kind: u32) -> bool {
+     // SAFETY: plain data filled in by the query.
+     let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+     // SAFETY: a valid out pointer of the right size.
+     let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+     n != 0
+         && info.State == mem::MEM_COMMIT
+-        && info.Type == mem::MEM_PRIVATE
++        && info.Type == kind
+         && info.Protect == mem::PAGE_READWRITE
+         && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(len)
+ }
+@@ -785,6 +835,30 @@ unsafe fn section(p: &mut Probe, rig: &mut Rig) {
+             p.reserved_section_refused = opened.is_err();
+             p.lines.push(format!("a section made reserved, as the page pool is today (OpenExistingHeapFromFileMapping): {}", hr(&opened)));
+             drop(opened);
++            // The same section through a view committed whole, by its
++            // address: all of it, and its pages 2..4 alone
++            // (`VICTORY_INPLACE_VIEWS`).
++            let view = mem::MapViewOfFile(reserved, mem::FILE_MAP_WRITE, 0, 0, 8 * K64);
++            if !view.Value.is_null() {
++                let committed = !mem::VirtualAlloc(view.Value, 8 * K64, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null();
++                let all = open(&rig.device, From::Region(view.Value as usize));
++                let part = open(&rig.device, From::Part(view.Value as usize + 2 * K64, 2 * K64));
++                let mut reads = false;
++                if let Ok(heap) = &part
++                    && let Ok(buffer) = place(&rig.device, heap, 0, 2 * K64 as u64)
++                {
++                    let memory = view.Value.cast::<u8>().add(2 * K64);
++                    fill(memory, 2 * K64, 7);
++                    reads = rig.fetch(&buffer, 0, 2 * K64).is_ok_and(|got| same(memory, &got));
++                }
++                p.lines.push(format!(
++                    "a view of the reserved section committed whole ({committed}), by its address: all of it {}; a part of it {}, and the GPU reads its bytes {reads}",
++                    hr(&all),
++                    hr(&part)
++                ));
++                drop((all, part));
++                mem::UnmapViewOfFile(view);
++            }
+             windows_sys::Win32::Foundation::CloseHandle(reserved);
+         }
+         let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, SIZE as u32, std::ptr::null());

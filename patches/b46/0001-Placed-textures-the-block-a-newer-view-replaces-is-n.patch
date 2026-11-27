@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Thu, 26 Nov 2026 18:50:49 +0800
+Subject: [PATCH] Placed textures: the block a newer view replaces is never
+ longer than the texture
+
+Under the default stale rule a view written within 4 KiB of an older
+view's start replaced it. A texture smaller than 4 KiB (a tint palette)
+has neighbours of its own inside that block: each view written made
+them stale, null and out of the queue. The head is now min(4 KiB, the
+texture's bytes), on both sides of the comparison.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/descriptor/host.rs | 38 +++++++++++++++++++++--
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 6ddb31577..ea1d751e3 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -194,6 +194,7 @@ pub(crate) enum Rule {
+     /// bytes (or the older within its own). No two textures share the
+     /// block of their smallest levels. A view that only reaches into the
+     /// address range of an older texture's larger levels says nothing.
++    /// The block is the texture itself when that is smaller.
+     #[default]
+     Start,
+     /// Whenever their spans at full size overlap (the rule until run
+@@ -207,7 +208,8 @@ pub(crate) enum Rule {
+ }
+ 
+ /// The first bytes of a placed texture that are its own under
+-/// [`Rule::Start`]: the 4 KiB block its smallest levels share. (Of 129
++/// [`Rule::Start`]: the 4 KiB block its smallest levels share, or all
++/// of a smaller texture. (Of 129
+ /// pairs of overlapping neighbours in the listings of runs 188 and 189,
+ /// none starts closer than 0x2000 to the one before it.)
+ const HEAD: u64 = 4096;
+@@ -255,9 +257,13 @@ impl Spans {
+         let rule = self.rule;
+         // The spans the view cannot be there with.
+         let clashing: Vec<u64> = match rule {
++            // A head is never longer than its texture (local): a texture
++            // of a few hundred bytes (a tint palette) has neighbours of
++            // its own inside 4 KiB, which a full head made stale.
+             Rule::Start => self
+                 .by_start
+-                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
++                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD.min(end - start)))
++                .filter(|&(&at, span)| at >= start || start - at < HEAD.min(span.0.saturating_sub(at)))
+                 .map(|(at, _)| *at)
+                 .collect(),
+             Rule::Overlap | Rule::Never => self.overlapping(start, end),
+@@ -3450,6 +3456,34 @@ mod tests {
+         assert_eq!(spans.by_slot.len(), 3);
+     }
+ 
++    /// Textures smaller than 4 KiB packed one after another (tint
++    /// palettes, 0x100 bytes each): each is its own head, so writing one
++    /// leaves its neighbours; one written inside another replaces it.
++    #[test]
++    fn small_neighbours_inside_4_kib_stay() {
++        let mut spans = Spans::default();
++        let at = 0x7_0000_0000u64;
++        for i in 0..4u64 {
++            assert!(spans.note(i as u32, at + i * 0x100, at + (i + 1) * 0x100, true).is_empty());
++        }
++        // Written again, in another order, and from another slot.
++        assert!(spans.note(2, at + 0x200, at + 0x300, true).is_empty());
++        assert!(spans.note(9, at, at + 0x100, true).is_empty());
++        // A large texture right after a small one, and a small one right
++        // before a large one: neither starts inside the other's bytes.
++        assert!(spans.note(10, at + 0x400, at + 0x2c400, true).is_empty());
++        assert!(spans.note(11, at + 0x1_0000, at + 0x3_c000, true).is_empty());
++        assert!(spans.note(12, at + 0xff00, at + 0x1_0000, true).is_empty());
++        assert_eq!(spans.by_slot.len(), 8);
++        // A start inside a small texture replaces it alone.
++        assert_eq!(spans.note(13, at + 0x180, at + 0x200, true), [1]);
++        // A texture whose head a small one starts in replaces that one.
++        assert_eq!(spans.note(14, at + 0x280, at + 0x1280, true), [2, 3, 10]);
++        // A draw's view that clashes is left out.
++        assert!(spans.note(15, at + 0x80, at + 0x100, false).is_empty());
++        assert_eq!(spans.by_slot.get(&15), None);
++    }
++
+     /// A slot written with another texture leaves its old span; the same
+     /// view written again changes nothing.
+     #[test]

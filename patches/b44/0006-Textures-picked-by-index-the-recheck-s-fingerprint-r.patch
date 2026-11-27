@@ -1,0 +1,400 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Tue, 24 Nov 2026 22:11:26 -0400
+Subject: [PATCH 06/43] Textures picked by index: the recheck's fingerprint
+ reads every mip of every slice
+
+The recheck added in a803c87 compares a fingerprint of 16 KiB at the
+start, middle and end of a texture's memory. Each slice stores its mips
+smallest first with mip 0 last, so for a plain 2D texture those windows
+land on the tail and mip 0 only: mips 1 and 2 (about a quarter of the
+bytes) and every mip in between are never read. In an array or cube map
+they see two slices of six or more. A mip or slice that arrived after the
+upload there was still missed (the commit's own "known gap").
+
+Layout::sample_ranges (victory-formats) gives one range at the start of
+each mip of each slice, tail mips at their places in the tail block: 1 KiB
+each, at most 64 per texture, spread evenly over slices and mips when
+there are more, adjacent ranges joined into one read. The ranges are
+worked out from the staging buffer's layout at upload, kept with the slot,
+and read on top of the three windows, so the new fingerprint sees every
+change the old one saw. A 4096-square texture with all its mips: 10 reads,
+12 KiB more per look; a 512 cube map with 10 mips: 40 reads, 52 KiB.
+
+VICTORY_HEAP_RECHECK_MIPS=0 keeps the three windows alone (the
+fingerprint is then the same as before).
+
+Checked: victory-formats tests on Linux, including a test that every mip
+of every slice (tail mips too) has a range over bytes its elements are
+stored at, found through Layout::offset rather than the mip offsets; the
+Windows target builds and passes clippy with and without diagnostics.
+Not yet run in the game.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 6f1fc6b53f75990d7b0708df6167e1cef7958220)
+---
+ crates/victory-formats/src/texture.rs     | 137 ++++++++++++++++++++++
+ crates/victory-gpu/src/descriptor/host.rs |  25 ++--
+ crates/victory-gpu/src/draw.rs            |  15 +--
+ crates/victory-gpu/src/texture.rs         |  49 ++++++--
+ 4 files changed, 202 insertions(+), 24 deletions(-)
+
+diff --git a/crates/victory-formats/src/texture.rs b/crates/victory-formats/src/texture.rs
+index fa719c939..63961ceb3 100644
+--- a/crates/victory-formats/src/texture.rs
++++ b/crates/victory-formats/src/texture.rs
+@@ -529,6 +529,55 @@ impl Layout {
+         }
+     }
+ 
++    /// Byte ranges (offset, bytes) of the texture to sample for a cheap look
++    /// at whether its memory changed: one inside each mip of each slice
++    /// (those in the tail at their places in its block), the first `window`
++    /// bytes of the mip or all of it if it is smaller (a mip's elements
++    /// start at its start; a tail mip may fill only part of its place). A
++    /// texture streams in whole mips, so a mip that arrives late changes
++    /// bytes under its range.
++    ///
++    /// At most `most` ranges: with more mips than that over all slices, the
++    /// ranges are taken at evenly spread places in the order of the memory.
++    /// In order, inside `size`, with ranges that touch or overlap joined.
++    pub fn sample_ranges(&self, window: u64, most: usize) -> Vec<(u64, u64)> {
++        if self.slice_size == 0 || window == 0 || most == 0 {
++            return Vec::new();
++        }
++        // Where each mip of a slice starts: those in the tail at their
++        // places in the tail block (which is at 0), the others at their
++        // offsets; 0 in any case.
++        let mut starts: Vec<u64> = self
++            .mips
++            .iter()
++            .map(|m| m.tail.map_or(m.offset, |t| u64::from(t.offset)))
++            .chain([0])
++            .filter(|&at| at < self.slice_size)
++            .collect();
++        starts.sort_unstable();
++        starts.dedup();
++        let per = starts.len();
++        let total = per * self.slices as usize;
++        let picked = total.min(most);
++        let mut out: Vec<(u64, u64)> = Vec::with_capacity(picked);
++        for i in 0..picked {
++            let g = if total > most { i * total / most } else { i };
++            let (slice, r) = (g / per, g % per);
++            let base = slice as u64 * self.slice_size;
++            let (from, to) = (starts[r], starts.get(r + 1).copied().unwrap_or(self.slice_size));
++            let at = base + from;
++            let len = window.min(to - from).min(self.size.saturating_sub(at));
++            if len == 0 {
++                continue;
++            }
++            match out.last_mut() {
++                Some(last) if at <= last.0 + last.1 => last.1 = last.1.max(at + len - last.0),
++                _ => out.push((at, len)),
++            }
++        }
++        out
++    }
++
+     /// Byte offset of element (`x`, `y`) of mip `mip` in array slice or
+     /// depth slice `z`. Coordinates must lie inside the mip.
+     pub fn offset(&self, mip: u32, x: u32, y: u32, z: u32) -> Result<u64, Error> {
+@@ -1176,4 +1225,92 @@ mod tests {
+         );
+         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+     }
++
++    #[allow(clippy::too_many_arguments)]
++    fn plane(dimension: Dimension, w: u32, h: u32, depth: u32, mips: u32, bpe: u32, block: u32, swizzle: Swizzle) -> Desc {
++        Desc { dimension, width: w, height: h, depth, mips, element_bytes: bpe, block, samples: 1, swizzle }
++    }
++
++    /// Each mip of each slice, tail mips included, has a sampled range
++    /// over bytes its elements are stored at (found through `offset`, not
++    /// through the mip offsets `sample_ranges` uses).
++    #[test]
++    fn every_mip_of_every_slice_is_sampled() {
++        use Dimension::*;
++        let cases = [
++            plane(Tex2d, 2048, 2048, 1, 12, 16, 4, Swizzle::SW_64KB_D),
++            plane(Tex2d, 1024, 512, 1, 11, 4, 1, Swizzle::SW_64KB_S),
++            plane(Tex2d, 512, 512, 6, 10, 8, 4, Swizzle::SW_64KB_D),
++            plane(Tex2d, 300, 200, 1, 9, 4, 1, Swizzle::LINEAR),
++            plane(Tex2d, 256, 256, 4, 9, 4, 1, Swizzle::SW_4KB_S),
++            plane(Tex2d, 4096, 64, 1, 13, 2, 1, Swizzle::SW_64KB_D),
++        ];
++        for desc in cases {
++            let l = Layout::new(&desc).unwrap();
++            let ranges = l.sample_ranges(1024, 10_000);
++            for z in 0..l.slices {
++                for (i, m) in l.mips.iter().enumerate() {
++                    let (w, h) = (m.width, m.height);
++                    let xs: Vec<u32> = (0..w).step_by((w as usize / 16).max(1)).chain([w - 1]).collect();
++                    let ys: Vec<u32> = (0..h).step_by((h as usize / 16).max(1)).chain([h - 1]).collect();
++                    let (mut lo, mut hi) = (u64::MAX, 0);
++                    for &y in &ys {
++                        for &x in &xs {
++                            let at = l.offset(i as u32, x, y, z).unwrap();
++                            lo = lo.min(at);
++                            hi = hi.max(at + u64::from(desc.element_bytes));
++                        }
++                    }
++                    assert!(
++                        ranges.iter().any(|&(at, n)| at < hi && at + n > lo),
++                        "{desc:?}: mip {i} of slice {z} ({lo:#x}..{hi:#x}) has no range in {ranges:x?}"
++                    );
++                }
++            }
++        }
++    }
++
++    /// Ranges are in order, apart, inside the texture, at most `most` and
++    /// at most `window` bytes each before joining, for every mode.
++    #[test]
++    fn sample_ranges_are_ordered_and_bounded() {
++        use Dimension::*;
++        let swizzles = [
++            Swizzle::LINEAR, Swizzle::SW_4KB_S, Swizzle::SW_64KB_D, Swizzle::SW_64KB_S_X,
++            Swizzle::SW_64KB_D_X, Swizzle::SW_64KB_R_X, Swizzle::SW_4KB_S_X,
++        ];
++        for swizzle in swizzles {
++            for (dimension, w, h, depth, mips, bpe, block) in [
++                (Tex2d, 4096, 4096, 1, 13, 16, 4),
++                (Tex2d, 1000, 300, 64, 10, 4, 1),
++                (Tex2d, 1, 1, 1, 1, 4, 1),
++                (Tex2d, 64, 64, 6, 7, 8, 4),
++            ] {
++                let desc = plane(dimension, w, h, depth, mips, bpe, block, swizzle);
++                let Ok(l) = Layout::new(&desc) else { continue };
++                for (window, most) in [(1024u64, 32usize), (256, 4), (1 << 20, 1000)] {
++                    let r = l.sample_ranges(window, most);
++                    assert!(!r.is_empty() && r.len() <= most, "{desc:?}");
++                    let bytes: u64 = r.iter().map(|x| x.1).sum();
++                    assert!(bytes <= window * most as u64, "{desc:?}");
++                    for pair in r.windows(2) {
++                        assert!(pair[0].0 + pair[0].1 < pair[1].0, "{desc:?}: {r:x?}");
++                    }
++                    let last = r[r.len() - 1];
++                    assert!(last.1 > 0 && last.0 + last.1 <= l.size, "{desc:?}");
++                }
++            }
++        }
++    }
++
++    /// With more mips over all slices than ranges, the ranges spread over
++    /// the slices instead of staying in the first ones.
++    #[test]
++    fn capped_ranges_spread_over_the_slices() {
++        let l = Layout::new(&plane(Dimension::Tex2d, 256, 256, 64, 9, 4, 1, Swizzle::SW_64KB_D)).unwrap();
++        let r = l.sample_ranges(512, 16);
++        let slices: Vec<u64> = r.iter().map(|&(at, _)| at / l.slice_size).collect();
++        assert_eq!(slices.first(), Some(&0));
++        assert!(*slices.last().unwrap() >= 56, "{slices:?}");
++    }
+ }
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 080954729..4d2a620c2 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -501,7 +501,7 @@ fn tabled_out() -> bool {
+ }
+ 
+ /// What the queue of textures picked by index knows of a title slot.
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[derive(Clone, Debug, PartialEq, Eq)]
+ struct Waiting {
+     /// The frame from which the slot is due.
+     due: u64,
+@@ -521,8 +521,14 @@ struct Waiting {
+     /// the fingerprint it had at the upload, how many looks found it
+     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
+     checked: (u64, u64, u64, u8, u64),
++    /// The ranges of its memory the fingerprint reads at the start of its
++    /// mips (`crate::texture::staged_memory`), with `checked`.
++    mips: Option<Mips>,
+ }
+ 
++/// Ranges of a texture's memory (offsets, bytes) read for its fingerprint.
++pub(crate) type Mips = std::sync::Arc<[(u64, u64)]>;
++
+ /// The queue of title slots whose texture view waits to be brought up to
+ /// date for shaders that pick textures by index: which are due, and in
+ /// which order (no host heap needed, so it is tested without one).
+@@ -547,7 +553,7 @@ impl TextureQueue {
+         }
+         self.writes += 1;
+         let write = self.writes;
+-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
++        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), mips: None });
+     }
+ 
+     fn remove(&mut self, index: u32) {
+@@ -653,18 +659,20 @@ impl TextureQueue {
+     /// with fingerprint `print`: looked at again from frame `due`, for a
+     /// title that fills a texture's memory after it wrote the view (the
+     /// `looks`-th such look; `uploaded` is the upload's frame).
++    /// `mips`: the ranges the fingerprint read besides its windows.
+     #[allow(clippy::too_many_arguments)]
+-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
++    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), mips: Option<Mips>, print: u64, looks: u8, uploaded: u64) {
+         if let Some(w) = self.same(index, write) {
+             (w.due, w.looks, w.mapped) = (due, 1, 0);
+             w.checked = (at.0, at.1, print, looks, uploaded);
++            w.mips = mips;
+         }
+     }
+ 
+     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
+     /// waiting for such a look.
+-    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
+-        self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
++    fn checked(&self, index: u32) -> Option<((u64, u64, u64, u8, u64), Option<Mips>)> {
++        self.slots.get(&index).filter(|w| w.checked.2 != 0).map(|w| (w.checked, w.mips.clone()))
+     }
+ 
+     /// The memory slot `index`'s texture lies in was mapped, unmapped or
+@@ -675,7 +683,7 @@ impl TextureQueue {
+         self.writes += 1;
+         let write = self.writes;
+         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
+-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
++        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), mips: None });
+     }
+ 
+     /// Bytes of slot `index`'s memory that were mapped at its last upload
+@@ -1162,16 +1170,17 @@ impl HostHeap {
+         write: u64,
+         due: u64,
+         at: (u64, u64),
++        mips: Option<Mips>,
+         print: u64,
+         looks: u8,
+         uploaded: u64,
+     ) {
+         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+-        textures.recheck(index, write, due, at, print, looks, uploaded);
++        textures.recheck(index, write, due, at, mips, print, looks, uploaded);
+     }
+ 
+     /// See [`TextureQueue::checked`].
+-    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
++    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<((u64, u64, u64, u8, u64), Option<Mips>)> {
+         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
+     }
+ 
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 9ba0c2fb6..f2747eafb 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -1806,15 +1806,16 @@ impl State {
+             // may fill the texture's memory itself only afterwards, with
+             // no descriptor write and nothing from the runtime to tell of
+             // it. The host copy then kept what the memory held at the
+-            // first look for the rest of the run. The look reads 48 KiB;
++            // first look for the rest of the run. The look reads 48 KiB and
++            // the start of each mip of each slice (`texture::fingerprint`);
+             // only a changed texture is uploaded again.
+             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
+-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+-                if crate::texture::fingerprint(at, len) == print {
++            if let Some(((at, len, print, looks, uploaded), mips)) = host.texture_slot_checked(index) {
++                if crate::texture::fingerprint(at, len, mips.as_deref().unwrap_or_default()) == print {
+                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                         Some(wait) => {
+-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
++                            host.texture_slot_recheck(index, write, frame + wait, (at, len), mips, print, looks + 1, uploaded)
+                         }
+                         None => host.texture_slot_done(index, write, None),
+                     }
+@@ -1983,9 +1984,9 @@ impl State {
+             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+             match memory {
+                 // Whole and uploaded: looked at again (see above).
+-                Some((at, len)) => {
+-                    let print = crate::texture::fingerprint(at, len);
+-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
++                Some((at, len, mips)) => {
++                    let print = crate::texture::fingerprint(at, len, mips.as_deref().unwrap_or_default());
++                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), mips, print, 0, frame);
+                 }
+                 None => host.texture_slot_done(index, write, again),
+             }
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+index bdac9f751..7edc2561c 100644
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -1128,18 +1128,42 @@ pub(crate) fn unstage(resource: This) {
+     }
+ }
+ 
+-/// Where a staged title texture's memory is: address and bytes.
+-pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
++/// Where a staged title texture's memory is: address and bytes, and the
++/// ranges of it (offsets from the address, bytes) that [`fingerprint`]
++/// reads besides its three windows: the start of every mip of every slice
++/// ([`victory_formats::texture::Layout::sample_ranges`]). None with
++/// `VICTORY_HEAP_RECHECK_MIPS=0`: the three windows alone, as before.
++pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64, Option<std::sync::Arc<[(u64, u64)]>>)> {
+     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+-    let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
+-    Some((at as u64, len as u64))
++    let staging = map.as_ref()?.get(&(resource as usize))?;
++    let (at, len) = staging.memory();
++    let mips = recheck_mips().then(|| staging.layout.sample_ranges(MIP_WINDOW, MIP_RANGES).into());
++    Some((at as u64, len as u64, mips))
++}
++
++/// Bytes [`fingerprint`] reads at the start of each mip, and the most mips
++/// it reads of one texture (spread over its slices and mips when it has
++/// more). A 4096-square texture with all its mips: 10 reads, 12 KiB; a cube
++/// map with 10 mips: 40 reads, 52 KiB.
++const MIP_WINDOW: u64 = 1 << 10;
++const MIP_RANGES: usize = 64;
++
++/// Whether [`fingerprint`] also reads the start of every mip of every
++/// slice (`VICTORY_HEAP_RECHECK_MIPS=0`: no).
++fn recheck_mips() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK_MIPS").is_none_or(|v| v != "0"))
+ }
+ 
+ /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
+-/// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
+-/// (a texture streams in whole mips; the small ones lie first). Read
+-/// through the kernel, so pages not there count as zeros.
+-pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
++/// it up to 48 KiB, else of 16 KiB at its start, its middle and its end,
++/// and of the ranges `mips` (offsets from `at`, bytes; see
++/// [`staged_memory`]). A texture streams in whole mips, and the three
++/// windows alone see only the smallest mips and mip 0 of a plain texture,
++/// and only two slices of an array or cube map: a mip or slice that
++/// arrived after the upload elsewhere was not seen. Read through the
++/// kernel, so pages not there count as zeros.
++pub(crate) fn fingerprint(at: u64, len: u64, mips: &[(u64, u64)]) -> u64 {
+     const WINDOW: usize = 16 << 10;
+     thread_local! {
+         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+@@ -1148,7 +1172,8 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+     let mut hasher = blake3::Hasher::new();
+     READ.with(|read| {
+         let mut read = read.borrow_mut();
+-        read.resize(3 * WINDOW, 0);
++        let longest = mips.iter().map(|&(_, n)| n as usize).max().unwrap_or(0);
++        read.resize((3 * WINDOW).max(longest), 0);
+         let mut take = |from: usize, bytes: usize| {
+             read[..bytes].fill(0);
+             crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+@@ -1160,6 +1185,12 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+             take(0, WINDOW);
+             take((len / 2) & !0xfff, WINDOW);
+             take(len - WINDOW, WINDOW);
++            for &(from, bytes) in mips {
++                let from = from as usize;
++                if from < len {
++                    take(from, (bytes as usize).min(len - from));
++                }
++            }
+         }
+     });
+     let hash = hasher.finalize();

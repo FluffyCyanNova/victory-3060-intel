@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Wed, 25 Nov 2026 15:12:29 +0800
+Subject: [PATCH 27/43] Local (fork-ports2): a ray-tracing structure's view
+ gives its address; the reads-0 warning says what stands there
+
+A shader that takes the address of a buffer view at a fixed table entry got 0
+where the entry is a ray-tracing structure's view: it has no resource, its
+description holds the structure's address. That address is given now. Where
+the address is still 0, the warning names what the entry holds (no view, a
+view of what resource with what description, a constant buffer, not a table).
+Unbuilt.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/draw.rs | 39 ++++++++++++++++++++++++++++------
+ 1 file changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 7481d9211..d74e79af0 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -793,14 +793,41 @@ impl State {
+             return 0;
+         }
+         // The title address of the buffer view at that dword of the table.
+-        let address = match self.roots_ref(compute).get(usize::from(slot)) {
+-            Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
+-                .and_then(|view| crate::descriptor::host::buffer_range(&view))
+-                .map_or(0, |range| range.0),
+-            _ => 0,
++        let root = match self.roots_ref(compute).get(usize::from(slot)) {
++            Some(&Root::Table(table)) => Some(table),
++            _ => None,
+         };
++        let view = root.and_then(|table| crate::descriptor::view(table + u64::from(dword) * 4));
++        let address = view.as_ref().map_or(0, |view| {
++            use crate::descriptor::View;
++            match (crate::descriptor::host::buffer_range(view), view) {
++                (Some(range), _) => range.0,
++                // (local, fork-ports2) A ray-tracing structure's view has no
++                // resource: its description holds the structure's address
++                // (`D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`,
++                // the location in the union at byte 16), which is what the
++                // code that walks the structure takes.
++                (None, View::Shader(_, Some(desc))) if desc[1] == 11 => u64::from(desc[4]) | u64::from(desc[5]) << 32,
++                _ => 0,
++            }
++        });
+         if address == 0 {
+-            once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
++            // (local) what stands there, so the log says why.
++            let what = match (root, &view) {
++                (Some(_), None) => "no view recorded in the table's entry (or its resource is gone)".to_owned(),
++                (Some(_), Some(crate::descriptor::View::Shader(r, desc))) => {
++                    format!("a shader resource view, resource {r:#x}, description {desc:x?}")
++                }
++                (Some(_), Some(crate::descriptor::View::Unordered(r, _, desc))) => {
++                    format!("an unordered access view, resource {r:#x}, description {desc:x?}")
++                }
++                (Some(_), Some(crate::descriptor::View::Constant(a, size))) => {
++                    format!("a constant buffer at {a:#x}, {size} bytes")
++                }
++                (Some(_), Some(_)) => "a sampler or a placed view that is not a buffer".to_owned(),
++                _ => "the root slot is not a table".to_owned(),
++            };
++            once!(slot, dword, what, "a shader takes the address of a buffer view that is not there: it reads 0");
+         }
+         if kind == USER_VIEW_ADDRESS {
+             address as u32

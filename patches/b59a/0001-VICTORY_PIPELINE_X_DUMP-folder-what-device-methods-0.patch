@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VIctory contributor <contributor@users.noreply.invalid>
+Date: Fri, 27 Nov 2026 22:48:45 +0800
+Subject: [PATCH] VICTORY_PIPELINE_X_DUMP=<folder>: what device methods 0x1c8
+ and 0x218 are handed
+
+Off when unset; the two methods fail as they did (E_NOTIMPL) either way.
+A run's log counted 16,384 calls of 0x1c8 and 2,048 of 0x218: pipelines
+the title goes without. Their descriptions are not the PC ones: 0x1c8
+names a root signature and six pieces (address, length), 0x218 thirteen
+words with four such pieces, two addresses and a hash-like word. To
+write the methods, the pieces themselves have to be read.
+
+With the switch, the first 8 calls of each method write to the folder:
+- x<slot>-<call>.txt: the description's first 64 words and its pieces,
+- x<slot>-<call>-w<word>-<bytes>.bin: each piece (an address followed by
+  a length of up to 1 MiB; an address alone: 256 bytes), read through
+  the kernel, so a piece that is not mapped is said and skipped.
+The files hold the title's data and stay on this machine.
+
+Tests: the pieces of the two descriptions a run logged
+(the_pieces_of_a_0x1c8_..., the_pieces_of_a_0x218_...). victory-gpu:
+156 passed, 0 failed.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/device.rs | 122 +++++++++++++++++++++++++++++++
+ 1 file changed, 122 insertions(+)
+
+diff --git a/crates/victory-gpu/src/device.rs b/crates/victory-gpu/src/device.rs
+index dfbf2b225..d6a4cc0af 100644
+--- a/crates/victory-gpu/src/device.rs
++++ b/crates/victory-gpu/src/device.rs
+@@ -346,6 +346,85 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
+     }
+ }
+ 
++/// The pieces a description of device method 0x1c8 or 0x218 names, from
++/// its 64-bit `words`: `(word, address, bytes)`. A word that is an
++/// address followed by a length of up to 1 MiB is a piece of that length
++/// (the length's word is then skipped); an address alone is looked at for
++/// 256 bytes. Word 0 is the root signature, an object of ours.
++fn pipeline_x_pieces(words: &[u64]) -> Vec<(usize, u64, usize)> {
++    let address = |w: u64| (0x1_0000..1 << 47).contains(&w);
++    let mut pieces = Vec::new();
++    let mut i = 1;
++    while i < words.len() {
++        let w = words[i];
++        match words.get(i + 1) {
++            Some(&len @ 1..=0x10_0000) if address(w) => {
++                pieces.push((i, w, len as usize));
++                i += 2;
++            }
++            _ => {
++                if address(w) {
++                    pieces.push((i, w, 256));
++                }
++                i += 1;
++            }
++        }
++    }
++    pieces
++}
++
++/// `VICTORY_PIPELINE_X_DUMP=<folder>`: the descriptions of the first 8
++/// calls of device methods 0x1c8 and 0x218 each, written there so that the
++/// two methods can be worked out: `x<slot>-<call>.txt` with the
++/// description's first 64 words, and `x<slot>-<call>-w<word>-<bytes>.bin`
++/// for each piece they name ([`pipeline_x_pieces`]), read through the
++/// kernel (none of it is known to be mapped). The files hold the title's
++/// data: they stay on this machine. Off when unset; the call fails as it
++/// did either way.
++#[cfg(windows)]
++fn pipeline_x_dump(slot: usize, call: u32, desc: *const u8) {
++    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
++    let Some(dir) = DIR.get_or_init(|| {
++        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_PIPELINE_X_DUMP")?);
++        match std::fs::create_dir_all(&dir) {
++            Ok(()) => {
++                tracing::info!(dir = %dir.display(), "descriptions of device methods 0x1c8 and 0x218 are written out (VICTORY_PIPELINE_X_DUMP)");
++                Some(dir)
++            }
++            Err(e) => {
++                tracing::warn!(error = %e, dir = %dir.display(), "VICTORY_PIPELINE_X_DUMP: no such folder can be made");
++                None
++            }
++        }
++    }) else {
++        return;
++    };
++    if call > 8 || desc.is_null() {
++        return;
++    }
++    let mut bytes = [0u8; 512];
++    if !crate::host::read_into(desc, &mut bytes) {
++        return;
++    }
++    let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
++    let mut text = format!("slot {slot:#x} call {call} description at {:#x}\n", desc as usize);
++    for (i, w) in words.iter().enumerate() {
++        text.push_str(&format!("w{i:02} {w:#018x}\n"));
++    }
++    // Only the description's own words name its pieces: 0x1c8 has 16 of
++    // them at most, 0x218 has 13 and the next description behind them.
++    let own = if slot == 0x218 { 13 } else { 16 };
++    for (i, at, len) in pipeline_x_pieces(&words[..own]) {
++        let mut piece = vec![0u8; len];
++        let read = crate::host::read_into(at as *const u8, &mut piece);
++        text.push_str(&format!("piece w{i:02} at {at:#x}, {len} bytes: {}\n", if read { "written" } else { "not readable" }));
++        if read {
++            let _ = std::fs::write(dir.join(format!("x{slot:x}-{call}-w{i:02}-{len}.bin")), &piece);
++        }
++    }
++    let _ = std::fs::write(dir.join(format!("x{slot:x}-{call}.txt")), text);
++}
++
+ /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
+ /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
+ /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
+@@ -369,6 +448,8 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
+         // SAFETY: the title's out pointer (a local of its own).
+         unsafe { *out = std::ptr::null() };
+     }
++    #[cfg(windows)]
++    pipeline_x_dump(SLOT, calls, desc);
+     if calls <= 4 || calls.is_power_of_two() {
+         // Sixteen 64-bit words at `at`, read through the kernel: neither
+         // pointer is known to be mapped.
+@@ -464,6 +545,47 @@ mod tests {
+     use super::*;
+     use crate::object::slot;
+ 
++    /// The first call of method 0x1c8 a run logged: six pieces, each an
++    /// address and a length.
++    #[test]
++    fn the_pieces_of_a_0x1c8_description_are_its_address_and_length_pairs() {
++        let words = [
++            0x1c7dcc6e990, 0x904b186f4, 0x184, 0x904b18878, 0xbc, 0x948a27300, 0x200, 0x904b18934, 0xd0, 0x948a27500, 0x200,
++            0x904b18a04, 0xb0, 0, 0, 0,
++        ];
++        assert_eq!(
++            pipeline_x_pieces(&words),
++            [
++                (1, 0x904b186f4, 0x184),
++                (3, 0x904b18878, 0xbc),
++                (5, 0x948a27300, 0x200),
++                (7, 0x904b18934, 0xd0),
++                (9, 0x948a27500, 0x200),
++                (11, 0x904b18a04, 0xb0)
++            ]
++        );
++    }
++
++    /// The first call of method 0x218: four pieces with lengths, two
++    /// addresses alone (256 bytes each); the hash-like word and zeros are
++    /// no pieces.
++    #[test]
++    fn the_pieces_of_a_0x218_description_include_lone_addresses() {
++        let words =
++            [0x1c7e598a760, 0x904b147c0, 0x1c, 0x904b147dc, 0x14, 0x948a20000, 0x180, 0x904b147f0, 0x118, 0x90729a6e0, 0x907269de0, 0xd7e7b1a22f0c3802, 0];
++        assert_eq!(
++            pipeline_x_pieces(&words),
++            [
++                (1, 0x904b147c0, 0x1c),
++                (3, 0x904b147dc, 0x14),
++                (5, 0x948a20000, 0x180),
++                (7, 0x904b147f0, 0x118),
++                (9, 0x90729a6e0, 256),
++                (10, 0x907269de0, 256)
++            ]
++        );
++    }
++
+     fn create_as(iid: &Iid) -> (HRESULT, This) {
+         let version = CHECKED_VERSION;
+         let mut device = std::ptr::null();
+-- 
+2.56.0.windows.3
+
