@@ -1743,6 +1743,65 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
+/// Whether [`let_go_idle`] lets host copies go only while the card is short
+/// of room (`VICTORY_TEXTURE_SWEEP_PRESSURE=1`; off by default: every copy
+/// idle for a few seconds goes, as before).
+///
+/// The sweep takes a copy nothing asked for during 5 seconds and 4 frames,
+/// whether the card has room or not. At 3.5 frames a second that is 17
+/// frames: in run 71 the card stood at 6.9 to 7.8 GB of a budget of 11.3,
+/// no pass was turned down for lack of room, and still 62,875 copies were
+/// let go and 23,925 made again in 22 minutes. A copy made again is black
+/// until its upload has had its turn in the queue (4,100 to 4,700 slots
+/// stood in it): textures that go black for a frame or a few when they
+/// come back into view. With the switch a copy stays while there is room
+/// for more ([`sweeps_under_pressure`]), and the sweep works as before once
+/// there is not.
+#[cfg(windows)]
+fn sweep_pressure_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP_PRESSURE").is_some_and(|v| v == "1"))
+}
+
+/// With [`sweep_pressure_only`]: whether the sweep has work now. The
+/// texture queue has no `room` for a new copy ([`room`]: what it keeps for
+/// buffer copies and render targets counts as used), or the card is at
+/// three quarters of its budget or more (`memory`: budget and bytes in use,
+/// `Host::video_memory`; from there `host::vram_idle_ms` shortens the idle
+/// time too). Without a budget from the system it always has, as before.
+#[cfg(windows)]
+fn sweeps_under_pressure(room: bool, memory: Option<[u64; 4]>) -> bool {
+    let Some([budget, used, ..]) = memory else {
+        return true;
+    };
+    budget == 0 || !room || u128::from(used) * 100 >= u128::from(budget) * 75
+}
+
+#[cfg(all(test, windows))]
+mod sweep_tests {
+    use super::sweeps_under_pressure;
+
+    const MB: u64 = 1 << 20;
+
+    /// With `VICTORY_TEXTURE_SWEEP_PRESSURE=1` idle copies stay while the
+    /// card has room and is under three quarters of its budget.
+    #[test]
+    fn idle_copies_stay_while_the_card_has_room() {
+        // run 71: 7,300 MB in use of 11,345, room for more: nothing goes
+        assert!(!sweeps_under_pressure(true, Some([11_345 * MB, 7_300 * MB, 0, 0])));
+        assert!(!sweeps_under_pressure(true, Some([11_345 * MB, 393 * MB, 0, 0])));
+        // the texture queue is turned down (run 69: 8,215 MB and the room kept): the sweep works
+        assert!(sweeps_under_pressure(false, Some([11_345 * MB, 8_215 * MB, 0, 0])));
+        // three quarters of the budget and more, room or not
+        assert!(sweeps_under_pressure(true, Some([11_345 * MB, 8_509 * MB, 0, 0])));
+        assert!(!sweeps_under_pressure(true, Some([11_345 * MB, 8_508 * MB, 0, 0])));
+        assert!(sweeps_under_pressure(true, Some([1000, 750, 0, 0])));
+        // no budget known: as before
+        assert!(sweeps_under_pressure(true, None));
+        assert!(sweeps_under_pressure(true, Some([0, 0, 0, 0])));
+    }
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -1774,7 +1833,11 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let memory = crate::host::host().and_then(|h| h.video_memory());
+    if sweep_pressure_only() && !sweeps_under_pressure(room_lately(), memory) {
+        return;
+    }
+    let idle_ms = crate::host::vram_idle_ms(memory);
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);

@@ -339,6 +339,50 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
     Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
+/// What [`note_untiled`] counts by: a texture's width, height, bytes per
+/// element and tiling mode, and why it could not be tiled.
+type Untiled = (u32, u32, u32, u32, String);
+
+/// The count of `kind` after one more, among `seen` (at most `most` kinds
+/// are kept: one more than that is not counted, `None`).
+fn count_untiled(seen: &mut Vec<(Untiled, u64)>, kind: Untiled, most: usize) -> Option<u64> {
+    if let Some((_, n)) = seen.iter_mut().find(|(k, _)| *k == kind) {
+        *n += 1;
+        return Some(*n);
+    }
+    if seen.len() >= most {
+        return None;
+    }
+    seen.push((kind, 1));
+    Some(1)
+}
+
+/// A texture copied back whose texels could not be put into title memory
+/// (`Layout::tile` failed; nothing is written for it): says which kind of
+/// texture, the first time and at every doubling of its count. (It was
+/// said once for all kinds together, without the texture: run 70 could
+/// not tell which of three planes it was, or whether all three.)
+fn note_untiled(desc: &victory_formats::texture::Desc, why: &str, mip: u32, slice: u32) {
+    /// Kinds kept.
+    const MOST: usize = 64;
+    static SEEN: Mutex<Vec<(Untiled, u64)>> = Mutex::new(Vec::new());
+    let kind = (desc.width, desc.height, desc.element_bytes, desc.swizzle.0, why.to_owned());
+    let count = count_untiled(&mut SEEN.lock().unwrap_or_else(|e| e.into_inner()), kind, MOST);
+    if let Some(count) = count.filter(|n| n.is_power_of_two()) {
+        tracing::warn!(
+            e = why,
+            mip,
+            slice,
+            width = desc.width,
+            height = desc.height,
+            element_bytes = desc.element_bytes,
+            tiling = desc.swizzle.0,
+            count,
+            "a texture copied back could not be tiled"
+        );
+    }
+}
+
 /// Once the list has run, tile its texels back into the same title allocation.
 pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
@@ -374,8 +418,7 @@ pub(crate) fn land(back: &Back) {
         // SAFETY: the subresource's part of the mapped buffer.
         let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
         if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+            note_untiled(&back.layout.desc, &format!("{e:?}"), mip, slice);
             // SAFETY: mapped above.
             unsafe { back.buffer.Unmap(0, None) };
             return;
@@ -411,6 +454,23 @@ mod tests {
         released(93);
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+    }
+
+    /// Textures that could not be tiled are counted by kind, and no more
+    /// kinds than the limit are kept.
+    #[test]
+    fn untiled_textures_are_counted_by_kind() {
+        let kind = |w: u32, tiling: u32| (w, 64, 1, tiling, "Unsupported".to_owned());
+        let mut seen = Vec::new();
+        assert_eq!(count_untiled(&mut seen, kind(4096, 9), 2), Some(1));
+        assert_eq!(count_untiled(&mut seen, kind(4096, 9), 2), Some(2));
+        // another tiling mode of the same size is another kind
+        assert_eq!(count_untiled(&mut seen, kind(4096, 3), 2), Some(1));
+        assert_eq!(count_untiled(&mut seen, kind(4096, 9), 2), Some(3));
+        // the limit is reached: a third kind is not counted, the known ones are
+        assert_eq!(count_untiled(&mut seen, kind(2048, 9), 2), None);
+        assert_eq!(count_untiled(&mut seen, kind(4096, 3), 2), Some(2));
+        assert_eq!(seen.len(), 2);
     }
 
     /// `VICTORY_TEXTURE_BACK_PROGRAMS`: `1` names the water's three min-max

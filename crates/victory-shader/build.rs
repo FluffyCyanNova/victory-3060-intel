@@ -32,12 +32,27 @@ fn fnv(state: &mut [u64; 2], bytes: &[u8]) {
 }
 
 fn main() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // The crate's folder as cargo names it for THIS run of the script, not
+    // `env!`, which fixes it when the script is compiled: cargo does not
+    // compile a build script again because its tree moved. After such a
+    // move (2026-11-27) the script read a folder that was gone, found no
+    // file and gave every build the hash of nothing and no switches: the
+    // cache key stopped following the translator, and cached shaders kept
+    // the translations of older code for fifteen builds.
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR for a build script");
+    let src = Path::new(&manifest).join("src");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
     let mut list = Vec::new();
     files(&src, &mut list);
     list.sort();
+    // No source, no fingerprint: stop the build rather than hand out one
+    // that every other build shares.
+    assert!(
+        !list.is_empty(),
+        "victory-shader's build script found no source file under {}: the translator's fingerprint would be the same for every build",
+        src.display()
+    );
     let mut state = [0xcbf2_9ce4_8422_2325u64, 0x8422_2325_cbf2_9ce4u64];
     let mut switches = std::collections::BTreeSet::new();
     for p in &list {
