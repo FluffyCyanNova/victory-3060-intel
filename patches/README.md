@@ -1,3 +1,12 @@
+## Tested on
+
+| Part | |
+|---|---|
+| GPU | RTX 3060 12 GB |
+| CPU | Intel Core i3 (4 cores / 8 threads) |
+| RAM | 32 GB DDR4-3000 |
+| Storage | game on a hard disk (HDD) |
+
 # VIctory: local patch series
 
 A patch series, not a copy of any tree. It holds only the changes made or
