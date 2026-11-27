@@ -1,17 +1,6 @@
-## Tested on
-
-| Part | |
-|---|---|
-| GPU | RTX 3060 12 GB |
-| CPU | Intel Core i3 (4 cores / 8 threads) |
-| RAM | 32 GB DDR4-3000 |
-| Storage | one HDD |
-| OS | Windows 11 |
-| Console profile | Series S |
-
 # VIctory: local patch series
 
-A patch series, not a copy of any tree. It holds only the changes made or
+The patch series behind the source tree in this repository. It holds the changes made or
 ported locally on top of a public commit of the fork. No game data, no
 shader containers, no captures, no third-party tree.
 
